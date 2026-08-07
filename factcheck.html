@@ -2,6 +2,10 @@
 <!DOCTYPE html>
 <!--
   회의 FactCheck  (Gemini STT + Google Search grounding)
+  v0.3  2026.08.08  모델을 Gemini 3세대로 교체(2.5 계열은 신규 사용자 차단·2026.10 종료).
+        gemini-3.6-flash(권장)·gemini-3.5-flash-lite(저가)·gemini-3.1-pro(정밀).
+        2.5-flash의 한국어 받아쓰기 부정확 문제도 3.6-flash로 개선. 구형 저장 모델값은
+        loadSettings에서 무시하고 기본값 유지.
   v0.2  2026.08.08  음성 기록을 Web Speech API → Gemini STT로 교체.
         마이크 오디오를 침묵 기준으로 몇 초 조각으로 잘라(VAD) WAV로 Gemini에 전송해
         받아쓴다. 사파리·모바일 포함 모든 브라우저에서 동작(Web Speech는 Chrome/Edge 전용).
@@ -177,9 +181,9 @@
     <div class="sg">
       <label>모델</label>
       <select id="model" onchange="saveSettings()">
-        <option value="gemini-2.5-flash">gemini-2.5-flash (권장)</option>
-        <option value="gemini-2.5-pro">gemini-2.5-pro (정밀)</option>
-        <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite (저가)</option>
+        <option value="gemini-3.6-flash">gemini-3.6-flash (권장·최신)</option>
+        <option value="gemini-3.1-pro">gemini-3.1-pro (정밀·프리뷰)</option>
+        <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (저가)</option>
       </select>
     </div>
     <div class="sg">
@@ -203,7 +207,7 @@
       키는 이 브라우저에만 저장됩니다 · <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">키 발급</a>
     </div>
     <div class="version-tag">
-      FactCheck v0.2 · 2026.08.08<br>
+      FactCheck v0.3 · 2026.08.08<br>
       <span class="cost">받아쓰기 ≈ $0.2/1hr · 팩트체크 1,500건/일 무료 후 건당 ≈ $0.04</span>
     </div>
   </div>
@@ -303,7 +307,9 @@ function showKeySaved(saved) {
 function loadSettings() {
   $('apiKey').value = localStorage.getItem(LS.key) || '';
   showKeySaved(!!($('apiKey').value.trim()));
-  const m = localStorage.getItem(LS.model); if (m) $('model').value = m;
+  // 저장된 모델이 현재 목록에 있을 때만 적용 (구형 gemini-2.5-* 저장값은 무시하고 기본값 유지)
+  const m = localStorage.getItem(LS.model);
+  if (m && [...$('model').options].some(o => o.value === m)) $('model').value = m;
   const mx = localStorage.getItem(LS.max); if (mx) $('maxClaims').value = mx;
   const f = localStorage.getItem(LS.font) || '15'; $('fontSize').value = f;
   applyFontSize();
