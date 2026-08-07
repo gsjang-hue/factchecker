@@ -2,6 +2,9 @@
 <!DOCTYPE html>
 <!--
   회의 FactCheck  (Gemini STT + Google Search grounding)
+  v1.0  2026.08.08  ① 저장기록 상세에 AI 요약 — 회의 narrative 요약 + 뒷부분에 '사실'이 아닌
+        판정(거짓·과장·맥락필요·불확실)만 따로 정리(buildFlaggedSection). 요약은 세션에 저장.
+        ② 글자크기 조정이 팩트체크 결과 카드에도 적용되도록 --pt-size를 .fc-claim/.fc-reason에 연결.
   v0.9  2026.08.08  translate 앱 기능 이식: ① 저장기록 다중 선택 삭제(선택/전체선택/선택삭제).
         ② 저장기록 상세에 📋복사·📤보내기(navigator.share, 폴백은 .txt 다운로드).
         ③ 사용 기록 — GoatCounter(gsjang 계정) 페이지뷰 + Google Sheets 웹훅(동일 계정,
@@ -146,8 +149,8 @@
   .v-exagg .fc-badge { background: #2e2810; color: #f0c674; }
   .v-unsure .fc-badge { background: #12283a; color: #8ab4d8; }
   .v-context .fc-badge { background: #241a3a; color: #b18aff; }
-  .fc-claim { font-size: 14px; color: #f0f0f0; line-height: 1.6; margin-bottom: 6px; font-weight: 500; word-break: break-word; }
-  .fc-reason { font-size: 13px; color: #b8b8b8; line-height: 1.65; margin-bottom: 8px; word-break: break-word; }
+  .fc-claim { font-size: var(--pt-size, 15px); color: #f0f0f0; line-height: 1.6; margin-bottom: 6px; font-weight: 500; word-break: break-word; }
+  .fc-reason { font-size: calc(var(--pt-size, 15px) - 2px); color: #b8b8b8; line-height: 1.65; margin-bottom: 8px; word-break: break-word; }
   .fc-sources { display: flex; flex-direction: column; gap: 3px; }
   .fc-sources a { font-size: 11px; color: #8ab4d8; text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .fc-sources a:hover { text-decoration: underline; }
@@ -194,6 +197,11 @@
   .btn-copy { background: #1d3a1d; color: #30d158; border: 0.5px solid #30d15844; }
   .btn-copy.copied { background: #30d158; color: #fff; }
   .btn-download { background: #2c2c2e; color: #f0f0f0; border: 0.5px solid #444; }
+  .btn-summarize { background: #30d158; color: #fff; }
+  .btn-summarize:disabled { opacity: 0.5; }
+  .summary-box { background: #111; border: 0.5px solid #2a2a2a; border-radius: 10px; padding: 0.9rem 1rem; font-size: var(--pt-size, 15px); line-height: 1.8; color: #d5d5d5; white-space: pre-wrap; word-break: break-word; }
+  .summary-loading { color: #666; font-size: 13px; padding: 0.5rem 0; }
+  .modal-body h4.sum { color: #30d158; }
 
   @media (max-width: 640px) {
     .settings { flex-direction: row; }
@@ -263,7 +271,7 @@
       키는 이 브라우저에만 저장됩니다 · <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">키 발급</a>
     </div>
     <div class="version-tag">
-      FactCheck v0.9 · 2026.08.08<br>
+      FactCheck v1.0 · 2026.08.08<br>
       <span class="cost">받아쓰기 ≈ $0.2/1hr · 팩트체크 1,500건/일 무료 후 건당 ≈ $0.04</span>
     </div>
   </div>
@@ -326,6 +334,7 @@
     </div>
     <div class="modal-body" id="modalBody"></div>
     <div class="modal-actions">
+      <button class="action-btn btn-summarize" id="modalSumBtn" onclick="summarizeModal()">✨ AI 요약</button>
       <button class="action-btn btn-copy" id="modalCopyBtn" onclick="copyModalSession()">📋 복사</button>
       <button class="action-btn btn-download" onclick="shareModalSession()">📤 보내기</button>
     </div>
@@ -1045,6 +1054,7 @@ function deleteSession(id) {
 let modalSession = null;
 function buildSessionText(s) {
   let t = '[회의 FactCheck] ' + s.title + '\n' + s.date + '\n\n';
+  if (s.summary) t += '■ AI 요약\n' + s.summary + '\n\n';
   t += '■ 회의 기록\n' + s.transcript + '\n\n';
   t += '■ 팩트체크 결과 (' + (s.results || []).length + '건)\n';
   (s.results || []).forEach((r, i) => {
@@ -1080,10 +1090,17 @@ async function shareModalSession() {
   a.download = (modalSession.title || 'factcheck').replace(/[\\/:*?"<>|]/g, '_').slice(0, 40) + '.txt';
   a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
+function renderModalSummary(text) {
+  const box = $('modalSummaryBox'); if (!box) return;
+  box.innerHTML = text
+    ? '<div class="summary-box">' + esc(text) + '</div>'
+    : '<div class="summary-loading">아직 요약이 없습니다. 아래 <b>✨ AI 요약</b> 버튼을 누르세요.</div>';
+}
 function openModal(s) {
   modalSession = s;
   $('modalTitle').textContent = s.title;
-  let html = '<h4>회의 기록</h4><div class="modal-transcript">' + highlightedParas(s.transcript, s.results) + '</div>';
+  let html = '<h4 class="sum">✨ AI 요약</h4><div id="modalSummaryBox"></div>';
+  html += '<h4>회의 기록</h4><div class="modal-transcript">' + highlightedParas(s.transcript, s.results) + '</div>';
   html += '<h4>팩트체크 결과 (' + (s.results || []).length + '건)</h4>';
   (s.results || []).forEach((r, i) => {
     const v = VERDICTS[r.verdict] || VERDICTS['불확실'];
@@ -1099,9 +1116,50 @@ function openModal(s) {
     html += '</div>';
   });
   $('modalBody').innerHTML = html;
+  renderModalSummary(s.summary);
   $('modal').classList.remove('hidden');
 }
 function closeModal() { $('modal').classList.add('hidden'); }
+
+/* ── AI 요약 (저장기록 상세) ── */
+async function summarizeTranscript(transcript, model) {
+  const prompt =
+    '다음은 한국어 회의를 받아쓴 기록이다. 아래 형식 그대로 간결한 한국어 요약을 작성하라(서론·맺음말 없이).\n\n' +
+    '[핵심 요약]\n- (3~5개 불릿)\n\n[주요 논의]\n- (주제별 불릿)\n\n[결정·액션 아이템]\n- (있으면 나열, 없으면 "특이사항 없음")\n\n' +
+    '회의 기록:\n"""\n' + transcript + '\n"""';
+  const data = await geminiCall({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.3 } }, model);
+  return (extractText(data) || '(요약 생성 실패)').trim();
+}
+// 팩트체크 결과 중 '사실'이 아닌 항목만 정리(카드 번호 유지)
+function buildFlaggedSection(results) {
+  let s = '[⚠️ 사실이 아니거나 확인이 필요한 주장]\n';
+  const flagged = (results || []).map((r, i) => ({ r, n: i + 1 })).filter(x => x.r.verdict !== '사실');
+  if (!flagged.length) return s + '- 검증된 주장이 모두 "사실"로 판정되었습니다.';
+  flagged.forEach(({ r, n }) => {
+    s += '\n' + n + '. [' + r.verdict + '] ' + r.claim + '\n';
+    if (r.reason) s += '   → ' + r.reason + '\n';
+  });
+  return s.trim();
+}
+async function summarizeModal() {
+  if (!modalSession) return;
+  const key = (localStorage.getItem(LS.key) || '').trim();
+  if (!key) { if ($('settings').classList.contains('collapsed')) toggleSettings(); setErr('먼저 API 키를 입력하세요'); return; }
+  const btn = $('modalSumBtn'); btn.disabled = true;
+  const box = $('modalSummaryBox'); if (box) box.innerHTML = '<div class="summary-loading">✨ 요약 생성 중…</div>';
+  try {
+    const narrative = await summarizeTranscript(modalSession.transcript, $('model').value);
+    const full = narrative + '\n\n' + buildFlaggedSection(modalSession.results);
+    modalSession.summary = full;
+    const list = loadSessions();
+    const i = list.findIndex(x => x.id === modalSession.id);
+    if (i >= 0) { list[i].summary = full; localStorage.setItem(LS.sessions, JSON.stringify(list)); }
+    renderModalSummary(full);
+    sendUsageEvent('summarize', { total: (modalSession.results || []).length });
+  } catch (e) {
+    if (box) box.innerHTML = '<div class="summary-loading">요약 실패: ' + esc(e.message) + '</div>';
+  } finally { btn.disabled = false; }
+}
 
 /* ===================== 시작 ===================== */
 (function init() {
