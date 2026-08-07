@@ -2,6 +2,11 @@
 <!DOCTYPE html>
 <!--
   회의 FactCheck  (Gemini STT + Google Search grounding)
+  v0.7  2026.08.08  ① 팩트체크 건별 넘버링 — 전사문 하이라이트와 결과 카드에 같은 번호를
+        표시해 위치를 한눈에 매칭. ② 문단 분리를 "긴 침묵 + 앞 문단이 문장으로 종결"일
+        때만 하도록 바꿔 문장·조사 중간 절단 방지(STT 속도 영향 없음). STT가 문장 끝에
+        문장부호를 붙이도록 유도. ③ 판정 안정화 — verify temperature 0 + 판정 기준(rubric)
+        명시(핵심 사실이 맞으면 표현 부정확은 거짓 대신 과장/맥락필요).
   v0.6  2026.08.08  받아쓰기 정확도 개선: (1) 조각 크기 확대(침묵 0.5→0.7s·최대 4.5→9s)로
         문장 중간 오절단·문맥부족 오인식 완화. (2) '회의 주제·키워드' 선택 입력 추가 —
         STT 프롬프트에 힌트로 넣어 고유명사·전문용어 인식률을 높임(맥락 에코 없이).
@@ -112,6 +117,7 @@
   mark.hl-exagg   { background: #3a3210; color: #f4d94a; }
   mark.hl-unsure  { background: #12283a; color: #bcdcff; }
   mark.hl-context { background: #241a3a; color: #d9c2ff; }
+  .hl-num { font-size: 0.72em; font-weight: 800; vertical-align: super; margin: 0 1px 0 2px; opacity: 0.95; }
 
   /* 결과 요약 줄 */
   .result-summary { font-size: 12px; color: #aaa; padding: 6px 10px; background: #151515; border: 0.5px solid #262626; border-radius: 8px; margin-bottom: 12px; line-height: 1.6; display: none; }
@@ -125,6 +131,7 @@
   .fc-card.v-exagg { border-left-color: #f0c674; }
   .fc-card.v-unsure { border-left-color: #8ab4d8; }
   .fc-card.v-context { border-left-color: #b18aff; }
+  .fc-num { display: inline-block; min-width: 19px; height: 19px; line-height: 19px; text-align: center; font-size: 11px; font-weight: 700; border-radius: 50%; background: #2c2c2c; color: #ddd; margin-right: 7px; vertical-align: 1px; }
   .fc-badge { display: inline-block; font-size: 11px; font-weight: 700; border-radius: 5px; padding: 2px 9px; margin-bottom: 8px; letter-spacing: 0.02em; }
   .v-true .fc-badge { background: #1d3a1d; color: #30d158; }
   .v-false .fc-badge { background: #3a1414; color: #ff6b60; }
@@ -231,7 +238,7 @@
       키는 이 브라우저에만 저장됩니다 · <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">키 발급</a>
     </div>
     <div class="version-tag">
-      FactCheck v0.6 · 2026.08.08<br>
+      FactCheck v0.7 · 2026.08.08<br>
       <span class="cost">받아쓰기 ≈ $0.2/1hr · 팩트체크 1,500건/일 무료 후 건당 ≈ $0.04</span>
     </div>
   </div>
@@ -310,7 +317,7 @@ const PARA_BREAK_MS = 1500;         // 이 이상 쉬면 새 문단으로 분리
 let stream = null, actx = null, proc = null;
 let chunkBuf = [], chunkSamples = 0, silentSamples = 0, hasSpeechInChunk = false;
 let interSilence = 0;               // 조각 사이(발화 시작 전) 침묵 누적 — 문단 분리 판단용
-let chunkNewPara = true;            // 이번 조각이 새 문단으로 시작해야 하는지
+let chunkLongPause = true;          // 이번 조각 앞에 긴 침묵이 있었는지(문단 분리 후보)
 let watchdog = null;
 /* STT 병렬 처리 풀 — 조각을 여러 개 동시에 보내되(속도), 순서대로 화면에 붙인다 */
 const STT_CONC = 3;
@@ -380,7 +387,20 @@ function switchTab(name) {
 
 /* ===================== 기록창 ===================== */
 // 전사문 전체를 평문으로 얻는다(문단 사이 줄바꿈 포함)
-function getTranscript() { return ($('transcriptBox').innerText || '').replace(/ /g, ' ').replace(/\n{3,}/g, '\n\n').trim(); }
+function getTranscript() {
+  const box = $('transcriptBox');
+  const lines = [];
+  box.childNodes.forEach(node => {
+    if (node.nodeType === 3) { const t = (node.textContent || '').trim(); if (t) lines.push(t); return; }
+    if (node.nodeType === 1) {
+      const clone = node.cloneNode(true);
+      if (clone.querySelectorAll) clone.querySelectorAll('.hl-num').forEach(n => n.remove());
+      const t = (clone.textContent || '').trim();
+      if (t) lines.push(t);
+    }
+  });
+  return lines.join('\n').trim();
+}
 // 평문을 문단(.seg) 단위로 그려 넣는다
 function setTranscript(text) {
   const box = $('transcriptBox'); box.innerHTML = '';
@@ -395,18 +415,31 @@ function updateCharCount() {
   const n = getTranscript().length;
   $('charCount').textContent = n ? n.toLocaleString() + '자' : '';
 }
-// 받아쓴 조각을 추가한다. newPara=true면 새 문단, 아니면 직전 문단에 이어붙인다.
-function appendFinal(text, newPara) {
+// 문장이 끝난 것으로 보이는지(문단 분리 판단용). 문장부호 또는 흔한 한국어 종결어미로 끝나면 true.
+function endsSentence(s) {
+  const t = (s || '').trim();
+  if (/[.?!…]["'”’)]?$/.test(t)) return true;
+  return /(습니다|습니까|됩니다|합니다|입니다|해요|에요|예요|어요|아요|겠죠|거죠|잖아요|네요|는데요|다|요|죠|까|군요|랍니다|더라고요)$/.test(t);
+}
+// 받아쓴 조각을 추가한다. longPause(직전 긴 침묵)가 있고 앞 문단이 문장으로 끝났을 때만 새 문단.
+function appendFinal(text, longPause) {
   const t = text.trim(); if (!t) return;
   const box = $('transcriptBox');
   const last = box.lastElementChild;
-  // 하이라이트된 문단(mark 포함)에는 이어붙이지 않고 새 문단을 만든다
-  const canAppend = !newPara && last && last.classList && last.classList.contains('seg') && !last.querySelector('mark');
-  if (canAppend) {
-    last.textContent = (last.textContent + ' ' + t).replace(/\s+/g, ' ').trim();
-  } else {
+  const hasLast = last && last.classList && last.classList.contains('seg') && !last.querySelector('mark');
+  let newPara = !hasLast;
+  if (hasLast) {
+    const prev = last.textContent.trim();
+    // 긴 침묵이 있어도 앞 문단이 문장으로 끝났을 때만 문단을 나눈다(문장·조사 중간 절단 방지).
+    if (longPause && endsSentence(prev)) newPara = true;
+    // 안전장치: 한 문단이 너무 길어지면 침묵 지점에서 끊는다.
+    if (longPause && prev.length > 220) newPara = true;
+  }
+  if (newPara) {
     const d = document.createElement('div'); d.className = 'seg'; d.textContent = t;
     box.appendChild(d);
+  } else {
+    last.textContent = (last.textContent + ' ' + t).replace(/\s+/g, ' ').trim();
   }
   const sc = box.closest('.col-body'); if (sc) sc.scrollTop = sc.scrollHeight;
   onTranscriptEdit();
@@ -418,6 +451,7 @@ function sttPrompt(hint) {
     '들린 내용을 그대로 한국어로 정확히 받아적으세요.\n' +
     '- 이 오디오는 긴 회의를 몇 초 단위로 자른 조각이라 문장이 중간에서 시작되거나 끝날 수 있습니다. 있는 그대로 받아적으세요.\n' +
     '- 숫자·날짜·고유명사·전문용어를 정확히 표기하세요.\n' +
+    '- 한 문장이 완결되면 끝에 마침표(.)·물음표(?)·느낌표(!)를 붙이고, 문장 중간에서 잘린 것 같으면 문장부호를 붙이지 마세요.\n' +
     (hint ? '- 이 회의의 주제와 자주 등장하는 고유명사/용어: ' + hint + '. 발음이 이 용어들과 비슷하면 반드시 이 표기로 받아적으세요.\n' : '') +
     '- 의미 있는 발화가 없으면(침묵·잡음뿐) text를 빈 문자열로 두세요.\n' +
     '- 이 오디오에서 실제로 들린 것만 받아쓰고, 추측으로 앞뒤 내용을 지어내지 마세요.\n' +
@@ -470,14 +504,14 @@ function updateSttStatus() {
 }
 
 // 조각을 최대 STT_CONC개까지 동시에 전송하되, 결과는 순서(id)대로만 화면에 붙인다
-function enqueueChunk(f, newPara) { chunkQueue.push({ id: sttSeq++, data: f, newPara: newPara }); pumpStt(); }
+function enqueueChunk(f, longPause) { chunkQueue.push({ id: sttSeq++, data: f, longPause: longPause }); pumpStt(); }
 function pumpStt() {
   while (sttInFlight < STT_CONC && chunkQueue.length) {
     const item = chunkQueue.shift();
     sttInFlight++;
     transcribeChunk(item.data)
-      .then(text => { sttPending[item.id] = { text: text || '', newPara: item.newPara }; })
-      .catch(e => { sttPending[item.id] = { text: '', newPara: item.newPara }; setErr('받아쓰기 오류: ' + e.message); })
+      .then(text => { sttPending[item.id] = { text: text || '', longPause: item.longPause }; })
+      .catch(e => { sttPending[item.id] = { text: '', longPause: item.longPause }; setErr('받아쓰기 오류: ' + e.message); })
       .finally(() => { sttInFlight--; flushStt(); pumpStt(); });
   }
   updateSttStatus();
@@ -485,7 +519,7 @@ function pumpStt() {
 function flushStt() {
   while (Object.prototype.hasOwnProperty.call(sttPending, sttNext)) {
     const p = sttPending[sttNext]; delete sttPending[sttNext]; sttNext++;
-    if (p && p.text) { appendFinal(p.text, p.newPara); setErr(''); }
+    if (p && p.text) { appendFinal(p.text, p.longPause); setErr(''); }
   }
   updateSttStatus();
 }
@@ -496,11 +530,11 @@ function finalizeChunk() {
   const merged = new Float32Array(chunkSamples);
   let off = 0; for (const b of chunkBuf) { merged.set(b, off); off += b.length; }
   const trailing = silentSamples;   // 이 조각을 끝낸 후행 침묵 — 다음 조각 gap의 시작점
-  const np = chunkNewPara;
+  const lp = chunkLongPause;
   resetChunk();
   interSilence = trailing;          // 다음 발화 전까지 침묵을 계속 더해 문단 분리 판단
-  chunkNewPara = false;
-  enqueueChunk(merged, np);
+  chunkLongPause = false;
+  enqueueChunk(merged, lp);
 }
 function flushPendingChunk() {
   if (chunkSamples > 0 && hasSpeechInChunk) finalizeChunk();
@@ -526,7 +560,7 @@ function startMicProcessor() {
       if (!hasSpeechInChunk) interSilence += data.length;   // 발화 시작 전 침묵 누적
     } else {
       if (!hasSpeechInChunk) {                               // 이 조각의 첫 발화 시작
-        chunkNewPara = interSilence >= paraBreakSamples;     // 직전 쉼이 길면 새 문단
+        chunkLongPause = interSilence >= paraBreakSamples;   // 직전 쉼이 길었는지 기록
         hasSpeechInChunk = true;
       }
       silentSamples = 0;
@@ -561,7 +595,7 @@ async function startRec() {
   try { if (actx.state === 'suspended') await actx.resume(); } catch (_) {}
   chunkBuf = []; chunkSamples = 0; silentSamples = 0; hasSpeechInChunk = false;
   chunkQueue = []; sttSeq = 0; sttNext = 0; sttInFlight = 0; sttPending = {};
-  interSilence = SR * 10; chunkNewPara = true;   // 첫 발화는 새 문단으로 시작
+  interSilence = SR * 10; chunkLongPause = true;   // 첫 발화는 새 문단으로 시작
   startMicProcessor();
   recording = true;
   $('startBtn').disabled = true; $('stopBtn').disabled = false;
@@ -667,28 +701,30 @@ const VERDICTS = {
   '맥락필요': { cls: 'v-context', hl: 'hl-context' }
 };
 
-/* ── 전사문 하이라이트: 각 결과의 원문 quote를 찾아 판정 색으로 감싼다 ── */
+/* ── 전사문 하이라이트: 각 결과의 원문 quote를 찾아 판정 색 + 번호로 감싼다 ── */
 function buildMarks(results) {
-  return (results || []).filter(r => r.quote && r.quote.trim())
-    .map(r => ({ quote: r.quote.trim(), cls: (VERDICTS[r.verdict] || VERDICTS['불확실']).hl }));
+  return (results || []).map((r, i) => ({ num: i + 1, quote: (r.quote || '').trim(), cls: (VERDICTS[r.verdict] || VERDICTS['불확실']).hl }))
+    .filter(m => m.quote);
 }
-// 한 문단 안에서 marks를 겹치지 않게 감싸 HTML 반환
+// 한 문단 안에서 marks를 겹치지 않게 감싸 HTML 반환(끝에 번호 표시)
 function highlightPara(para, marks) {
-  let segs = [{ text: para, cls: null }];
+  let segs = [{ text: para, cls: null, num: 0 }];
   for (const m of marks) {
     const next = [];
     for (const s of segs) {
       if (s.cls) { next.push(s); continue; }
       const idx = s.text.indexOf(m.quote);
       if (idx < 0 || !m.quote) { next.push(s); continue; }
-      if (idx > 0) next.push({ text: s.text.slice(0, idx), cls: null });
-      next.push({ text: s.text.slice(idx, idx + m.quote.length), cls: m.cls });
+      if (idx > 0) next.push({ text: s.text.slice(0, idx), cls: null, num: 0 });
+      next.push({ text: s.text.slice(idx, idx + m.quote.length), cls: m.cls, num: m.num });
       const rest = s.text.slice(idx + m.quote.length);
-      if (rest) next.push({ text: rest, cls: null });
+      if (rest) next.push({ text: rest, cls: null, num: 0 });
     }
     segs = next;
   }
-  return segs.map(s => s.cls ? '<mark class="hl ' + s.cls + '">' + esc(s.text) + '</mark>' : esc(s.text)).join('');
+  return segs.map(s => s.cls
+    ? '<mark class="hl ' + s.cls + '">' + esc(s.text) + '<sup class="hl-num">' + s.num + '</sup></mark>'
+    : esc(s.text)).join('');
 }
 function highlightedParas(text, results) {
   const marks = buildMarks(results);
@@ -705,14 +741,20 @@ async function verifyClaim(item, model) {
     '다음 "주장"이 사실인지 Google 검색으로 확인하고 판정하라.\n' +
     '주장: "' + item.claim + '"\n' +
     (item.context ? '회의 맥락: ' + item.context + '\n' : '') +
+    '\n판정 기준(아래 정의를 엄격히 따를 것):\n' +
+    '- 사실: 핵심 내용이 검색 근거와 일치함\n' +
+    '- 거짓: 핵심 사실 자체가 근거와 명백히 어긋남(핵심이 맞으면 표현이 다소 부정확해도 거짓으로 판정하지 말 것)\n' +
+    '- 과장: 방향·핵심은 맞으나 수치나 정도가 부풀려짐\n' +
+    '- 맥락필요: 대체로 맞지만 중요한 조건·맥락이 빠져 오해의 소지가 있음\n' +
+    '- 불확실: 신뢰할 만한 근거를 찾지 못함\n' +
     '\n반드시 아래 형식으로만, 한국어로 답하라:\n' +
     '판정: <사실|거짓|과장|불확실|맥락필요 중 정확히 하나>\n' +
     '근거: <검색 결과에 근거한 1~2문장 설명>\n\n' +
-    '규칙: 최신·정확한 정보를 검색해 판단할 것. 판정 단어는 반드시 5개 중 하나만 쓸 것.';
+    '규칙: 최신·정확한 정보를 검색해 판단할 것. 판정 단어는 반드시 5개 중 하나만 쓸 것. 주장을 문자 그대로 평가하되, 핵심 사실의 진위를 우선할 것.';
   const body = {
     contents: [{ parts: [{ text: prompt }] }],
     tools: [{ google_search: {} }],
-    generationConfig: { temperature: 0.1 }
+    generationConfig: { temperature: 0 }
   };
   const data = await geminiCall(body, model);
   const text = extractText(data);
@@ -756,11 +798,12 @@ async function runFactcheck() {
       return;
     }
 
-    // 새 주장 카드만 추가 생성(기존 카드는 유지)
-    const nodes = claims.map(c => {
+    // 새 주장 카드만 추가 생성(기존 카드는 유지). 번호는 누적 순서(base+i+1)로 매긴다.
+    const base = lastResults.length;
+    const nodes = claims.map((c, i) => {
       const d = document.createElement('div');
       d.className = 'fc-card loading';
-      d.innerHTML = '<div class="fc-claim">' + esc(c.claim) + '</div><div class="fc-spin">🔍 검색·검증 중…</div>';
+      d.innerHTML = '<span class="fc-num">' + (base + i + 1) + '</span><span class="fc-claim" style="display:inline">' + esc(c.claim) + '</span><div class="fc-spin">🔍 검색·검증 중…</div>';
       cards.appendChild(d); return d;
     });
 
@@ -772,7 +815,7 @@ async function runFactcheck() {
         try { results[i] = await verifyClaim(claims[i], model); }
         catch (e) { results[i] = { claim: claims[i].claim, quote: claims[i].quote || '', verdict: '불확실', reason: '검증 실패: ' + e.message, sources: [] }; }
         done++;
-        renderCard(nodes[i], results[i]);
+        renderCard(nodes[i], results[i], base + i + 1);
         setStatus('🔍 인터넷 검색으로 검증 중… (' + done + '/' + claims.length + ')', 'working');
       }
     }
@@ -795,10 +838,10 @@ async function runFactcheck() {
   }
 }
 
-function renderCard(node, r) {
+function renderCard(node, r, num) {
   const v = VERDICTS[r.verdict] || VERDICTS['불확실'];
   node.className = 'fc-card ' + v.cls;
-  let html = '<span class="fc-badge">' + esc(r.verdict) + '</span>';
+  let html = '<span class="fc-num">' + num + '</span><span class="fc-badge">' + esc(r.verdict) + '</span>';
   html += '<div class="fc-claim">' + esc(r.claim) + '</div>';
   html += '<div class="fc-reason">' + esc(r.reason) + '</div>';
   if (r.sources && r.sources.length) {
@@ -870,10 +913,10 @@ function openModal(s) {
   $('modalTitle').textContent = s.title;
   let html = '<h4>회의 기록</h4><div class="modal-transcript">' + highlightedParas(s.transcript, s.results) + '</div>';
   html += '<h4>팩트체크 결과 (' + (s.results || []).length + '건)</h4>';
-  (s.results || []).forEach(r => {
+  (s.results || []).forEach((r, i) => {
     const v = VERDICTS[r.verdict] || VERDICTS['불확실'];
     html += '<div class="fc-card ' + v.cls + '" style="margin-top:10px">';
-    html += '<span class="fc-badge">' + esc(r.verdict) + '</span>';
+    html += '<span class="fc-num">' + (i + 1) + '</span><span class="fc-badge">' + esc(r.verdict) + '</span>';
     html += '<div class="fc-claim">' + esc(r.claim) + '</div>';
     html += '<div class="fc-reason">' + esc(r.reason) + '</div>';
     if (r.sources && r.sources.length) {
