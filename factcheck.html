@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<!--
+  회의 FactCheck  (Gemini + Google Search grounding)
+  v0.1  2026.08.07  최초 버전
+        - Web Speech API(무료, ko-KR)로 회의 내용 실시간 기록
+        - "팩트체크" 버튼 → 그때까지의 기록에서 검증할 주장 추출(gemini-2.5-flash,
+          구조화 JSON) → 주장별 Google Search grounding으로 검증 → 판정/근거/출처 카드
+        - 서버·프록시 불필요. 브라우저에서 파일만 열면 동작. API 키는 localStorage 저장.
+        - 마이크 미지원/차단 시 기록창에 직접 타이핑/붙여넣기로도 동작.
+-->
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>회의 FactCheck</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0a1410; color: #f0f0f0; display: flex; flex-direction: column; height: 100dvh; overflow: hidden; }
+
+  /* 탭 */
+  .tab-bar { display: flex; border-bottom: 0.5px solid #1a3327; flex-shrink: 0; background: #0a1410; }
+  .tab { flex: 1; padding: 11px; font-size: 13px; font-weight: 500; text-align: center; color: #555; border: none; background: transparent; cursor: pointer; border-bottom: 2px solid transparent; }
+  .tab.active { color: #30d158; border-bottom-color: #30d158; }
+
+  .page { display: none; flex: 1; flex-direction: column; overflow: hidden; min-height: 0; }
+  .page.active { display: flex; }
+
+  /* 컨트롤 바 */
+  .ctrl-bar { padding: 0.5rem 0.8rem; border-bottom: 0.5px solid #1a3327; display: flex; gap: 6px; align-items: center; flex-shrink: 0; background: #0a1410; }
+  .ctrl-scroll { flex: 1; min-width: 0; display: flex; gap: 6px; align-items: center; overflow-x: auto; scrollbar-width: none; }
+  .ctrl-scroll::-webkit-scrollbar { display: none; }
+  button { padding: 6px 12px; font-size: 13px; font-weight: 500; border-radius: 7px; border: none; cursor: pointer; white-space: nowrap; -webkit-tap-highlight-color: transparent; }
+  #startBtn { background: #30d158; color: #fff; }
+  #startBtn:disabled { opacity: 0.35; }
+  #stopBtn { background: transparent; color: #ff453a; border: 0.5px solid #ff453a; }
+  #stopBtn:disabled { opacity: 0.3; }
+  #clearBtn { background: transparent; color: #888; border: 0.5px solid #444; }
+  #factBtn { background: #f0c674; color: #1a1400; font-weight: 700; }
+  #factBtn:disabled { opacity: 0.4; }
+  .ctrl-toggle { background: transparent; border: 0.5px solid #333; border-radius: 7px; color: #888; font-size: 15px; padding: 5px 9px; cursor: pointer; flex-shrink: 0; }
+  .ctrl-toggle.open { color: #30d158; border-color: #30d15844; background: #30d15811; }
+
+  /* 설정 패널 */
+  .settings { padding: 0.6rem 0.8rem; border-bottom: 0.5px solid #2a2a2a; display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; flex-shrink: 0; background: #131313; overflow: hidden; transition: max-height 0.2s ease, padding 0.2s ease; max-height: 260px; }
+  .settings.collapsed { max-height: 0; padding-top: 0; padding-bottom: 0; border-bottom: none; }
+  .sg { display: flex; flex-direction: column; gap: 3px; flex-shrink: 0; }
+  .sg label { font-size: 10px; color: #666; }
+  input[type="password"], input[type="text"], input[type="number"] { background: #1c1c1e; border: 0.5px solid #444; border-radius: 7px; color: #f0f0f0; font-size: 13px; padding: 6px 8px; outline: none; }
+  input[type="password"] { width: 210px; }
+  input[type="number"] { width: 66px; }
+  select { background: #1c1c1e; border: 0.5px solid #444; border-radius: 7px; color: #f0f0f0; font-size: 13px; padding: 6px 8px; outline: none; }
+  .set-note { font-size: 10px; color: #555; line-height: 1.5; flex-basis: 100%; }
+  .set-note a { color: #8ab4d8; }
+  .link-btn { background: transparent; color: #888; border: 0.5px solid #444; border-radius: 7px; padding: 6px 10px; font-size: 12px; }
+
+  /* 상태바 */
+  .statusbar { padding: 5px 1rem; display: flex; align-items: center; gap: 8px; font-size: 11px; color: #777; border-bottom: 0.5px solid #1a1a1a; flex-shrink: 0; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #444; flex-shrink: 0; }
+  .dot.recording { background: #ff453a; animation: blink 1s infinite; }
+  .dot.working { background: #f0c674; animation: blink 1s infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.25} }
+  .err { color: #ff8a80; margin-left: auto; font-size: 11px; text-align: right; }
+
+  /* 안내 배너 */
+  .notice-banner { display:flex; align-items:center; gap:8px; padding:8px 1rem; font-size:12px; flex-shrink:0; line-height:1.5; }
+  .notice-banner.hidden { display:none; }
+  .notice-banner.info { background:#10202e; color:#8ab4d8; border-bottom:0.5px solid #1e3a52; }
+  .notice-banner.warn { background:#2a2410; color:#f0c674; border-bottom:0.5px solid #4a3f1a; }
+  .notice-close { background:transparent; border:none; color:inherit; opacity:0.6; font-size:13px; padding:2px 4px; cursor:pointer; margin-left:auto; }
+
+  /* 본문 2단 */
+  .work-area { flex: 1; display: flex; overflow: hidden; min-height: 0; }
+  .col { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+  .col.results { flex: 1.15; }
+  .divider { width: 0.5px; background: #222; flex-shrink: 0; }
+  .col-header { padding: 8px 1rem 7px; font-size: 11px; color: #666; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; border-bottom: 0.5px solid #1a1a1a; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .col-body { flex: 1; overflow-y: auto; padding: 0.8rem 1rem; min-height: 0; }
+
+  /* 기록창 */
+  #interimLine { font-size: 12px; color: #f0c674; min-height: 16px; padding: 2px 1rem; opacity: 0.85; font-style: italic; flex-shrink: 0; }
+  #transcriptBox { width: 100%; height: 100%; background: transparent; border: none; outline: none; resize: none; color: #d0ecd0; font-size: var(--pt-size, 15px); line-height: 1.75; font-family: inherit; }
+  #transcriptBox::placeholder { color: #3a4a3a; }
+
+  /* 결과 요약 줄 */
+  .result-summary { font-size: 12px; color: #aaa; padding: 6px 10px; background: #151515; border: 0.5px solid #262626; border-radius: 8px; margin-bottom: 12px; line-height: 1.6; display: none; }
+  .result-summary.show { display: block; }
+  .result-summary b { color: #f0f0f0; }
+
+  /* 팩트체크 카드 */
+  .fc-card { border: 0.5px solid #262626; border-left-width: 3px; border-radius: 10px; padding: 0.75rem 0.85rem; margin-bottom: 12px; background: #151515; }
+  .fc-card.v-true { border-left-color: #30d158; }
+  .fc-card.v-false { border-left-color: #ff453a; }
+  .fc-card.v-exagg { border-left-color: #f0c674; }
+  .fc-card.v-unsure { border-left-color: #8ab4d8; }
+  .fc-card.v-context { border-left-color: #b18aff; }
+  .fc-badge { display: inline-block; font-size: 11px; font-weight: 700; border-radius: 5px; padding: 2px 9px; margin-bottom: 8px; letter-spacing: 0.02em; }
+  .v-true .fc-badge { background: #1d3a1d; color: #30d158; }
+  .v-false .fc-badge { background: #3a1414; color: #ff6b60; }
+  .v-exagg .fc-badge { background: #2e2810; color: #f0c674; }
+  .v-unsure .fc-badge { background: #12283a; color: #8ab4d8; }
+  .v-context .fc-badge { background: #241a3a; color: #b18aff; }
+  .fc-claim { font-size: 14px; color: #f0f0f0; line-height: 1.6; margin-bottom: 6px; font-weight: 500; word-break: break-word; }
+  .fc-reason { font-size: 13px; color: #b8b8b8; line-height: 1.65; margin-bottom: 8px; word-break: break-word; }
+  .fc-sources { display: flex; flex-direction: column; gap: 3px; }
+  .fc-sources a { font-size: 11px; color: #8ab4d8; text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .fc-sources a:hover { text-decoration: underline; }
+  .fc-src-label { font-size: 9px; color: #555; letter-spacing: 0.08em; margin-bottom: 2px; }
+  .fc-card.loading { color: #666; }
+  .fc-spin { font-size: 13px; color: #f0c674; }
+
+  .empty-msg { color: #444; font-size: 13px; text-align: center; padding: 2.5rem 1rem; line-height: 1.7; }
+
+  /* 저장 기록 탭 */
+  .saved-page { padding: 1rem; overflow-y: auto; flex: 1; min-height: 0; }
+  .session-item { background: #1c1c1e; border: 0.5px solid #2a2a2a; border-radius: 10px; padding: 0.85rem 1rem; margin-bottom: 8px; display: flex; align-items: center; gap: 10px; cursor: pointer; }
+  .session-item:active { background: #2a2a2a; }
+  .session-info { flex: 1; min-width: 0; }
+  .session-info .sname { font-size: 14px; font-weight: 500; color: #e0e0e0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .session-info .smeta { font-size: 11px; color: #666; margin-top: 3px; }
+  .session-del { font-size: 12px; color: #ff453a; background: transparent; border: 0.5px solid #ff453a44; border-radius: 6px; padding: 4px 9px; cursor: pointer; flex-shrink: 0; }
+
+  /* 모달 */
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; display: flex; flex-direction: column; }
+  .modal-overlay.hidden { display: none; }
+  .modal { background: #141414; position: absolute; inset: 0; display: flex; flex-direction: column; }
+  .modal-header { padding: 0.8rem 1rem; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; border-bottom: 0.5px solid #2a2a2a; }
+  .modal-title { font-size: 15px; font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .modal-close { font-size: 13px; color: #30d158; background: none; border: none; cursor: pointer; padding: 4px 8px; }
+  .modal-body { padding: 1rem; overflow-y: auto; flex: 1; }
+  .modal-body h4 { font-size: 11px; color: #666; letter-spacing: 0.06em; text-transform: uppercase; margin: 16px 0 8px; }
+  .modal-body h4:first-child { margin-top: 0; }
+  .modal-transcript { font-size: 13px; color: #cfe0cf; line-height: 1.7; white-space: pre-wrap; word-break: break-word; background: #101810; border: 0.5px solid #1e2e1e; border-radius: 8px; padding: 0.8rem; }
+
+  @media (max-width: 640px) {
+    .settings { flex-direction: row; }
+    input[type="password"] { width: 100%; }
+    .sg.key-sg { flex: 1 1 100%; }
+    .work-area { flex-direction: column; }
+    .divider { width: auto; height: 0.5px; }
+    .col { flex: 1; }
+  }
+</style>
+</head>
+<body>
+
+<div class="tab-bar">
+  <button class="tab active" data-tab="main" onclick="switchTab('main')">🔍 팩트체크</button>
+  <button class="tab" data-tab="saved" onclick="switchTab('saved')">📁 저장 기록</button>
+</div>
+
+<!-- ===== 메인 페이지 ===== -->
+<div class="page active" id="page-main">
+  <div class="ctrl-bar">
+    <div class="ctrl-scroll">
+      <button id="startBtn" onclick="startRec()">▶ 기록 시작</button>
+      <button id="stopBtn" onclick="stopRec()" disabled>⏸ 중지</button>
+      <button id="clearBtn" onclick="clearRec()">🗑 지우기</button>
+      <button id="factBtn" onclick="runFactcheck()">🔍 팩트체크</button>
+    </div>
+    <button class="ctrl-toggle" id="setToggle" onclick="toggleSettings()">⚙</button>
+  </div>
+
+  <div class="settings collapsed" id="settings">
+    <div class="sg key-sg">
+      <label>Google AI Studio API 키</label>
+      <input type="password" id="apiKey" placeholder="AIza..." oninput="saveSettings()">
+    </div>
+    <div class="sg">
+      <label>모델</label>
+      <select id="model" onchange="saveSettings()">
+        <option value="gemini-2.5-flash">gemini-2.5-flash (권장)</option>
+        <option value="gemini-2.5-pro">gemini-2.5-pro (정밀)</option>
+        <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite (저가)</option>
+      </select>
+    </div>
+    <div class="sg">
+      <label>최대 검증 주장 수</label>
+      <input type="number" id="maxClaims" min="1" max="30" value="10" onchange="saveSettings()">
+    </div>
+    <div class="sg">
+      <label>글자 크기</label>
+      <select id="fontSize" onchange="applyFontSize()">
+        <option value="14">작게</option>
+        <option value="15" selected>보통</option>
+        <option value="17">크게</option>
+        <option value="20">아주 크게</option>
+      </select>
+    </div>
+    <div class="sg">
+      <label>&nbsp;</label>
+      <button class="link-btn" onclick="clearApiKey()">키 삭제</button>
+    </div>
+    <div class="set-note">
+      키는 이 브라우저(localStorage)에만 저장되며 외부로 전송되지 않습니다.
+      팩트체크는 <b>Gemini + Google 검색(grounding)</b>으로 동작합니다 —
+      키 발급: <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">aistudio.google.com/app/apikey</a>.
+      검색 grounding은 무료 한도(대략 일 1,500건) 이후 과금될 수 있습니다.
+    </div>
+  </div>
+
+  <div class="statusbar">
+    <span class="dot" id="statusDot"></span>
+    <span id="statusText">대기 중 — 기록을 시작하거나 아래에 직접 입력하세요</span>
+    <span class="err" id="errText"></span>
+  </div>
+
+  <div class="notice-banner hidden" id="notice">
+    <span class="notice-text" id="noticeText"></span>
+    <button class="notice-close" onclick="document.getElementById('notice').classList.add('hidden')">✕</button>
+  </div>
+
+  <div class="work-area">
+    <div class="col">
+      <div class="col-header"><span>📝 회의 기록</span><span id="charCount" style="font-weight:400;letter-spacing:0;text-transform:none;color:#555;"></span></div>
+      <div id="interimLine"></div>
+      <div class="col-body">
+        <textarea id="transcriptBox" placeholder="여기에 회의 내용이 실시간으로 기록됩니다.&#10;마이크가 없거나 인식이 안 되면 직접 입력하거나 붙여넣어도 됩니다." oninput="onTranscriptEdit()"></textarea>
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div class="col results">
+      <div class="col-header"><span>✅ 팩트체크 결과</span></div>
+      <div class="col-body" id="resultBody">
+        <div class="result-summary" id="resultSummary"></div>
+        <div id="resultCards">
+          <div class="empty-msg">회의 기록을 남긴 뒤<br><b>🔍 팩트체크</b> 버튼을 누르면<br>검증할 주장을 뽑아 인터넷 검색으로 확인해 드립니다.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 저장 기록 페이지 ===== -->
+<div class="page" id="page-saved">
+  <div class="saved-page" id="savedList"></div>
+</div>
+
+<!-- ===== 상세 모달 ===== -->
+<div class="modal-overlay hidden" id="modal">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title" id="modalTitle"></span>
+      <button class="modal-close" onclick="closeModal()">닫기</button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* ===================== 상태 & 저장 ===================== */
+const LS = {
+  key: 'fc_apikey', model: 'fc_model', max: 'fc_maxclaims',
+  font: 'fc_fontsize', sessions: 'fc_sessions', draft: 'fc_draft'
+};
+let recognizing = false;   // Web Speech 동작 중
+let userStopped = false;   // 사용자가 중지 눌렀는지(자동 재시작 방지)
+let checking = false;      // 팩트체크 진행 중
+let recog = null;
+let lastResults = null;    // 최근 팩트체크 결과 배열
+
+/* ===================== 유틸 ===================== */
+const $ = id => document.getElementById(id);
+function setStatus(txt, mode) {
+  $('statusText').textContent = txt;
+  const dot = $('statusDot');
+  dot.className = 'dot' + (mode ? ' ' + mode : '');
+}
+function setErr(msg) { $('errText').textContent = msg || ''; }
+function showNotice(txt, type) {
+  const n = $('notice');
+  n.className = 'notice-banner ' + (type || 'info');
+  $('noticeText').innerHTML = txt;
+}
+function esc(s) { return (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+/* ===================== 설정 로드/저장 ===================== */
+function loadSettings() {
+  $('apiKey').value = localStorage.getItem(LS.key) || '';
+  const m = localStorage.getItem(LS.model); if (m) $('model').value = m;
+  const mx = localStorage.getItem(LS.max); if (mx) $('maxClaims').value = mx;
+  const f = localStorage.getItem(LS.font) || '15'; $('fontSize').value = f;
+  applyFontSize();
+  const draft = localStorage.getItem(LS.draft);
+  if (draft) { $('transcriptBox').value = draft; updateCharCount(); }
+}
+function saveSettings() {
+  localStorage.setItem(LS.key, $('apiKey').value.trim());
+  localStorage.setItem(LS.model, $('model').value);
+  localStorage.setItem(LS.max, $('maxClaims').value);
+}
+function applyFontSize() {
+  const f = $('fontSize').value;
+  document.documentElement.style.setProperty('--pt-size', f + 'px');
+  localStorage.setItem(LS.font, f);
+}
+function clearApiKey() {
+  if (!confirm('저장된 API 키를 삭제할까요?')) return;
+  localStorage.removeItem(LS.key); $('apiKey').value = '';
+}
+function toggleSettings() {
+  $('settings').classList.toggle('collapsed');
+  $('setToggle').classList.toggle('open');
+}
+
+/* ===================== 탭 ===================== */
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  $('page-main').classList.toggle('active', name === 'main');
+  $('page-saved').classList.toggle('active', name === 'saved');
+  if (name === 'saved') renderSaved();
+}
+
+/* ===================== 기록창 ===================== */
+function onTranscriptEdit() { updateCharCount(); localStorage.setItem(LS.draft, $('transcriptBox').value); }
+function updateCharCount() {
+  const n = $('transcriptBox').value.length;
+  $('charCount').textContent = n ? n.toLocaleString() + '자' : '';
+}
+function appendFinal(text) {
+  const box = $('transcriptBox');
+  const t = text.trim(); if (!t) return;
+  const sep = box.value && !/\s$/.test(box.value) ? ' ' : '';
+  box.value += sep + t;
+  box.scrollTop = box.scrollHeight;
+  onTranscriptEdit();
+}
+
+/* ===================== Web Speech API ===================== */
+function initRecognition() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) return null;
+  const r = new SR();
+  r.lang = 'ko-KR';
+  r.continuous = true;
+  r.interimResults = true;
+  r.onresult = (e) => {
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const res = e.results[i];
+      if (res.isFinal) appendFinal(res[0].transcript);
+      else interim += res[0].transcript;
+    }
+    $('interimLine').textContent = interim;
+  };
+  r.onerror = (e) => {
+    if (e.error === 'no-speech' || e.error === 'aborted') return; // 무시하고 재시작 로직에 맡김
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+      setErr('마이크 권한이 거부되었습니다');
+      showNotice('마이크 사용이 차단되어 음성 기록을 쓸 수 없습니다. 회의 내용을 <b>직접 입력/붙여넣기</b> 한 뒤 팩트체크하세요.', 'warn');
+      userStopped = true; finishRecUI();
+    } else {
+      setErr('인식 오류: ' + e.error);
+    }
+  };
+  r.onend = () => {
+    // continuous라도 브라우저가 주기적으로 종료 → 사용자가 멈춘 게 아니면 재시작
+    if (!userStopped) { try { r.start(); } catch (_) {} }
+    else finishRecUI();
+  };
+  return r;
+}
+function startRec() {
+  if (recognizing) return;
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    showNotice('이 브라우저는 음성 인식을 지원하지 않습니다(<b>Chrome / Edge 권장</b>). 회의 내용을 직접 입력한 뒤 팩트체크하세요.', 'warn');
+    return;
+  }
+  if (!recog) recog = initRecognition();
+  userStopped = false;
+  try { recog.start(); } catch (_) {}
+  recognizing = true;
+  setErr(''); $('interimLine').textContent = '';
+  $('startBtn').disabled = true; $('stopBtn').disabled = false;
+  setStatus('🎙 기록 중… 말하는 내용이 자동으로 적힙니다', 'recording');
+}
+function stopRec() {
+  if (!recognizing) return;
+  userStopped = true;
+  try { recog.stop(); } catch (_) {}
+}
+function finishRecUI() {
+  recognizing = false;
+  $('startBtn').disabled = false; $('stopBtn').disabled = true;
+  $('interimLine').textContent = '';
+  setStatus('일시정지 — 이어서 기록하거나 팩트체크하세요');
+}
+function clearRec() {
+  if ($('transcriptBox').value && !confirm('현재 기록을 모두 지울까요?')) return;
+  $('transcriptBox').value = ''; onTranscriptEdit();
+  $('resultCards').innerHTML = '<div class="empty-msg">회의 기록을 남긴 뒤<br><b>🔍 팩트체크</b> 버튼을 누르면<br>검증할 주장을 뽑아 인터넷 검색으로 확인해 드립니다.</div>';
+  $('resultSummary').classList.remove('show'); lastResults = null;
+}
+
+/* ===================== Gemini 호출 ===================== */
+function apiUrl(model) {
+  const key = localStorage.getItem(LS.key) || '';
+  return 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + encodeURIComponent(key);
+}
+async function geminiCall(body, model) {
+  const res = await fetch(apiUrl(model), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    let detail = '';
+    try { const j = await res.json(); detail = j.error && j.error.message ? j.error.message : ''; } catch (_) {}
+    throw new Error('HTTP ' + res.status + (detail ? ' — ' + detail : ''));
+  }
+  return res.json();
+}
+function extractText(data) {
+  try { return (data.candidates[0].content.parts || []).map(p => p.text || '').join(''); }
+  catch (_) { return ''; }
+}
+function extractSources(data) {
+  const out = [];
+  try {
+    const chunks = data.candidates[0].groundingMetadata.groundingChunks || [];
+    for (const c of chunks) {
+      if (c.web && c.web.uri) out.push({ uri: c.web.uri, title: c.web.title || c.web.uri });
+    }
+  } catch (_) {}
+  return out;
+}
+
+/* ── Pass A: 검증할 주장 추출 ── */
+async function extractClaims(transcript, model, max) {
+  const prompt =
+    '다음은 한국어 회의를 받아쓴 기록이다. 이 중에서 "사실 여부를 인터넷 검색으로 검증할 가치가 있는 주장"만 골라라.\n' +
+    '- 숫자·통계·날짜·고유명사·역사적/과학적 사실·인용·시장 데이터 등 객관적으로 확인 가능한 사실 주장만 선택\n' +
+    '- 개인 의견, 감정 표현, 미래 계획/다짐, 애매한 잡담, 인사말은 제외\n' +
+    '- 각 주장은 그 자체로 검색 가능하도록 완결된 한 문장으로 다시 써라\n' +
+    '- 중요도가 높은 순으로 최대 ' + max + '개까지\n' +
+    '- 검증할 만한 주장이 없으면 빈 배열을 반환\n\n' +
+    '회의 기록:\n"""\n' + transcript + '\n"""';
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0.2,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'ARRAY',
+        items: {
+          type: 'OBJECT',
+          properties: { claim: { type: 'STRING' }, context: { type: 'STRING' } },
+          required: ['claim']
+        }
+      }
+    }
+  };
+  const data = await geminiCall(body, model);
+  let arr = [];
+  try { arr = JSON.parse(extractText(data)); } catch (_) {}
+  if (!Array.isArray(arr)) arr = [];
+  return arr.filter(x => x && x.claim).slice(0, max);
+}
+
+/* ── Pass B: 주장 1건을 Google 검색으로 검증 ── */
+const VERDICTS = {
+  '사실': { cls: 'v-true' }, '거짓': { cls: 'v-false' }, '과장': { cls: 'v-exagg' },
+  '불확실': { cls: 'v-unsure' }, '맥락필요': { cls: 'v-context' }
+};
+async function verifyClaim(item, model) {
+  const prompt =
+    '다음 "주장"이 사실인지 Google 검색으로 확인하고 판정하라.\n' +
+    '주장: "' + item.claim + '"\n' +
+    (item.context ? '회의 맥락: ' + item.context + '\n' : '') +
+    '\n반드시 아래 형식으로만, 한국어로 답하라:\n' +
+    '판정: <사실|거짓|과장|불확실|맥락필요 중 정확히 하나>\n' +
+    '근거: <검색 결과에 근거한 1~2문장 설명>\n\n' +
+    '규칙: 최신·정확한 정보를 검색해 판단할 것. 판정 단어는 반드시 5개 중 하나만 쓸 것.';
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    tools: [{ google_search: {} }],
+    generationConfig: { temperature: 0.1 }
+  };
+  const data = await geminiCall(body, model);
+  const text = extractText(data);
+  const sources = extractSources(data);
+  // 판정/근거 파싱
+  let verdict = '불확실', reason = text.trim();
+  const vm = text.match(/판정\s*[:：]\s*\[?\s*(사실|거짓|과장|불확실|맥락필요)/);
+  if (vm) verdict = vm[1];
+  const rm = text.match(/근거\s*[:：]\s*([\s\S]+)/);
+  if (rm) reason = rm[1].trim();
+  return { claim: item.claim, verdict, reason, sources };
+}
+
+/* ── 팩트체크 실행 ── */
+async function runFactcheck() {
+  if (checking) return;
+  const key = (localStorage.getItem(LS.key) || '').trim();
+  if (!key) { toggleSettings(); setErr('먼저 API 키를 입력하세요'); return; }
+  const transcript = $('transcriptBox').value.trim();
+  if (transcript.length < 5) { setErr('회의 기록이 비어 있습니다'); return; }
+
+  const model = $('model').value;
+  const max = Math.max(1, Math.min(30, parseInt($('maxClaims').value) || 10));
+  checking = true; setErr('');
+  $('factBtn').disabled = true;
+  $('resultSummary').classList.remove('show');
+  const cards = $('resultCards');
+
+  try {
+    setStatus('🧠 검증할 주장을 찾는 중…', 'working');
+    cards.innerHTML = '<div class="fc-spin">🧠 회의 내용에서 검증할 주장을 추출하는 중…</div>';
+    const claims = await extractClaims(transcript, model, max);
+    if (!claims.length) {
+      cards.innerHTML = '<div class="empty-msg">검증할 만한 사실 주장을 찾지 못했습니다.<br>내용을 더 기록한 뒤 다시 시도해 보세요.</div>';
+      setStatus('완료 — 검증할 주장 없음'); return;
+    }
+    // 카드 자리 미리 생성
+    cards.innerHTML = '';
+    const nodes = claims.map((c, i) => {
+      const d = document.createElement('div');
+      d.className = 'fc-card loading';
+      d.innerHTML = '<div class="fc-claim">' + esc(c.claim) + '</div><div class="fc-spin">🔍 검색·검증 중…</div>';
+      cards.appendChild(d); return d;
+    });
+
+    const results = new Array(claims.length);
+    let done = 0;
+    const CONC = 3; let idx = 0;
+    async function worker() {
+      while (idx < claims.length) {
+        const i = idx++;
+        setStatus('🔍 인터넷 검색으로 검증 중… (' + (done) + '/' + claims.length + ')', 'working');
+        try { results[i] = await verifyClaim(claims[i], model); }
+        catch (e) { results[i] = { claim: claims[i].claim, verdict: '불확실', reason: '검증 실패: ' + e.message, sources: [] }; }
+        done++;
+        renderCard(nodes[i], results[i]);
+        setStatus('🔍 인터넷 검색으로 검증 중… (' + done + '/' + claims.length + ')', 'working');
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(CONC, claims.length) }, worker));
+
+    lastResults = results;
+    renderSummary(results);
+    saveSession(transcript, results);
+    setStatus('✅ 팩트체크 완료 — ' + results.length + '건 검증');
+  } catch (e) {
+    setErr('오류: ' + e.message);
+    cards.innerHTML = '<div class="empty-msg">팩트체크 중 오류가 발생했습니다.<br>' + esc(e.message) + '</div>';
+    setStatus('오류 발생');
+  } finally {
+    checking = false; $('factBtn').disabled = false;
+  }
+}
+
+function renderCard(node, r) {
+  const v = VERDICTS[r.verdict] || VERDICTS['불확실'];
+  node.className = 'fc-card ' + v.cls;
+  let html = '<span class="fc-badge">' + esc(r.verdict) + '</span>';
+  html += '<div class="fc-claim">' + esc(r.claim) + '</div>';
+  html += '<div class="fc-reason">' + esc(r.reason) + '</div>';
+  if (r.sources && r.sources.length) {
+    html += '<div class="fc-sources"><div class="fc-src-label">출처</div>';
+    for (const s of r.sources.slice(0, 5)) {
+      html += '<a href="' + esc(s.uri) + '" target="_blank" rel="noopener">🔗 ' + esc(s.title) + '</a>';
+    }
+    html += '</div>';
+  }
+  node.innerHTML = html;
+}
+function renderSummary(results) {
+  const c = { '사실': 0, '거짓': 0, '과장': 0, '불확실': 0, '맥락필요': 0 };
+  results.forEach(r => { c[r.verdict] = (c[r.verdict] || 0) + 1; });
+  const el = $('resultSummary');
+  el.innerHTML = '총 <b>' + results.length + '</b>건 · ' +
+    '<b style="color:#30d158">사실 ' + c['사실'] + '</b> · ' +
+    '<b style="color:#ff6b60">거짓 ' + c['거짓'] + '</b> · ' +
+    '<b style="color:#f0c674">과장 ' + c['과장'] + '</b> · ' +
+    '<b style="color:#8ab4d8">불확실 ' + c['불확실'] + '</b> · ' +
+    '<b style="color:#b18aff">맥락필요 ' + c['맥락필요'] + '</b>';
+  el.classList.add('show');
+}
+
+/* ===================== 세션 저장/조회 ===================== */
+function loadSessions() { try { return JSON.parse(localStorage.getItem(LS.sessions) || '[]'); } catch (_) { return []; } }
+function saveSession(transcript, results) {
+  const list = loadSessions();
+  const now = new Date();
+  const title = transcript.slice(0, 24).replace(/\s+/g, ' ') + (transcript.length > 24 ? '…' : '');
+  list.unshift({
+    id: 'fc_' + now.getTime(),
+    title: title || '(제목 없음)',
+    date: now.toLocaleString('ko-KR'),
+    transcript, results
+  });
+  // 저장 용량 보호: 최근 30개까지
+  try { localStorage.setItem(LS.sessions, JSON.stringify(list.slice(0, 30))); }
+  catch (_) { localStorage.setItem(LS.sessions, JSON.stringify(list.slice(0, 10))); }
+}
+function renderSaved() {
+  const list = loadSessions();
+  const el = $('savedList');
+  if (!list.length) { el.innerHTML = '<div class="empty-msg">저장된 팩트체크 기록이 없습니다.</div>'; return; }
+  el.innerHTML = '';
+  list.forEach(s => {
+    const item = document.createElement('div');
+    item.className = 'session-item';
+    const n = (s.results || []).length;
+    item.innerHTML =
+      '<div class="session-info"><div class="sname">' + esc(s.title) + '</div>' +
+      '<div class="smeta">' + esc(s.date) + ' · ' + n + '건 검증</div></div>' +
+      '<button class="session-del">삭제</button>';
+    item.querySelector('.session-info').onclick = () => openModal(s);
+    item.querySelector('.session-del').onclick = (e) => { e.stopPropagation(); deleteSession(s.id); };
+    el.appendChild(item);
+  });
+}
+function deleteSession(id) {
+  if (!confirm('이 기록을 삭제할까요?')) return;
+  const list = loadSessions().filter(s => s.id !== id);
+  localStorage.setItem(LS.sessions, JSON.stringify(list));
+  renderSaved();
+}
+function openModal(s) {
+  $('modalTitle').textContent = s.title;
+  let html = '<h4>회의 기록</h4><div class="modal-transcript">' + esc(s.transcript) + '</div>';
+  html += '<h4>팩트체크 결과 (' + (s.results || []).length + '건)</h4>';
+  (s.results || []).forEach(r => {
+    const v = VERDICTS[r.verdict] || VERDICTS['불확실'];
+    html += '<div class="fc-card ' + v.cls + '" style="margin-top:10px">';
+    html += '<span class="fc-badge">' + esc(r.verdict) + '</span>';
+    html += '<div class="fc-claim">' + esc(r.claim) + '</div>';
+    html += '<div class="fc-reason">' + esc(r.reason) + '</div>';
+    if (r.sources && r.sources.length) {
+      html += '<div class="fc-sources"><div class="fc-src-label">출처</div>';
+      r.sources.slice(0, 5).forEach(src => { html += '<a href="' + esc(src.uri) + '" target="_blank" rel="noopener">🔗 ' + esc(src.title) + '</a>'; });
+      html += '</div>';
+    }
+    html += '</div>';
+  });
+  $('modalBody').innerHTML = html;
+  $('modal').classList.remove('hidden');
+}
+function closeModal() { $('modal').classList.add('hidden'); }
+
+/* ===================== 시작 ===================== */
+(function init() {
+  loadSettings();
+  updateCharCount();
+  if (!(window.SpeechRecognition || window.webkitSpeechRecognition)) {
+    showNotice('이 브라우저는 음성 인식을 지원하지 않습니다(<b>Chrome / Edge 권장</b>). 회의 내용을 직접 입력/붙여넣기 한 뒤 팩트체크할 수 있습니다.', 'info');
+  }
+  if (location.protocol === 'file:') {
+    // file://에서도 Web Speech는 대개 동작하지만, 일부 환경은 https가 필요할 수 있음
+  }
+})();
+</script>
+</body>
+</html>
