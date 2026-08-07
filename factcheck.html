@@ -2,6 +2,10 @@
 <!DOCTYPE html>
 <!--
   회의 FactCheck  (Gemini STT + Google Search grounding)
+  v0.8  2026.08.08  ① 하이라이트 매칭 견고화 — quote가 원문과 조금 달라도(공백·어미 차이)
+        최장 공통 부분문자열로 근사 매칭해 누락 방지(findSpan). ② 자동 스크롤 개선 —
+        사용자가 위로 스크롤해 과거를 보는 중이면 새 텍스트가 와도 화면을 끌어내리지 않음
+        (맨 아래 근처일 때만 따라감).
   v0.7  2026.08.08  ① 팩트체크 건별 넘버링 — 전사문 하이라이트와 결과 카드에 같은 번호를
         표시해 위치를 한눈에 매칭. ② 문단 분리를 "긴 침묵 + 앞 문단이 문장으로 종결"일
         때만 하도록 바꿔 문장·조사 중간 절단 방지(STT 속도 영향 없음). STT가 문장 끝에
@@ -238,7 +242,7 @@
       키는 이 브라우저에만 저장됩니다 · <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">키 발급</a>
     </div>
     <div class="version-tag">
-      FactCheck v0.7 · 2026.08.08<br>
+      FactCheck v0.8 · 2026.08.08<br>
       <span class="cost">받아쓰기 ≈ $0.2/1hr · 팩트체크 1,500건/일 무료 후 건당 ≈ $0.04</span>
     </div>
   </div>
@@ -425,6 +429,9 @@ function endsSentence(s) {
 function appendFinal(text, longPause) {
   const t = text.trim(); if (!t) return;
   const box = $('transcriptBox');
+  const sc = box.closest('.col-body');
+  // 추가 전에 사용자가 맨 아래 근처였는지 확인(위로 스크롤해 과거를 보는 중이면 따라가지 않음)
+  const atBottom = sc ? (sc.scrollHeight - sc.scrollTop - sc.clientHeight < 40) : true;
   const last = box.lastElementChild;
   const hasLast = last && last.classList && last.classList.contains('seg') && !last.querySelector('mark');
   let newPara = !hasLast;
@@ -441,7 +448,7 @@ function appendFinal(text, longPause) {
   } else {
     last.textContent = (last.textContent + ' ' + t).replace(/\s+/g, ' ').trim();
   }
-  const sc = box.closest('.col-body'); if (sc) sc.scrollTop = sc.scrollHeight;
+  if (sc && atBottom) sc.scrollTop = sc.scrollHeight;   // 맨 아래에 있을 때만 자동 스크롤
   onTranscriptEdit();
 }
 
@@ -706,6 +713,30 @@ function buildMarks(results) {
   return (results || []).map((r, i) => ({ num: i + 1, quote: (r.quote || '').trim(), cls: (VERDICTS[r.verdict] || VERDICTS['불확실']).hl }))
     .filter(m => m.quote);
 }
+// 전사문에서 quote 위치를 찾는다. 정확히 없으면 공백 무시 + 최장 공통 부분문자열로 근사 매칭.
+// (모델이 준 quote가 원문과 조금 달라도 겹치는 부분을 하이라이트하기 위함)
+function findSpan(text, quote) {
+  if (!quote) return null;
+  const idx = text.indexOf(quote);
+  if (idx >= 0) return [idx, idx + quote.length];
+  const norm = s => { let o = ''; const map = []; for (let i = 0; i < s.length; i++) { if (/\s/.test(s[i])) continue; o += s[i]; map.push(i); } return { o, map }; };
+  const P = norm(text), Q = norm(quote);
+  const a = P.o, b = Q.o;
+  if (!a.length || !b.length) return null;
+  let best = 0, bestA = -1;
+  const prev = new Array(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i++) {
+    let diag = 0;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j];
+      if (a[i - 1] === b[j - 1]) { prev[j] = diag + 1; if (prev[j] > best) { best = prev[j]; bestA = i - prev[j]; } }
+      else prev[j] = 0;
+      diag = tmp;
+    }
+  }
+  if (best < Math.max(5, Math.floor(b.length * 0.4))) return null;   // 겹침이 너무 적으면 매칭 실패로 간주
+  return [P.map[bestA], P.map[bestA + best - 1] + 1];
+}
 // 한 문단 안에서 marks를 겹치지 않게 감싸 HTML 반환(끝에 번호 표시)
 function highlightPara(para, marks) {
   let segs = [{ text: para, cls: null, num: 0 }];
@@ -713,11 +744,12 @@ function highlightPara(para, marks) {
     const next = [];
     for (const s of segs) {
       if (s.cls) { next.push(s); continue; }
-      const idx = s.text.indexOf(m.quote);
-      if (idx < 0 || !m.quote) { next.push(s); continue; }
-      if (idx > 0) next.push({ text: s.text.slice(0, idx), cls: null, num: 0 });
-      next.push({ text: s.text.slice(idx, idx + m.quote.length), cls: m.cls, num: m.num });
-      const rest = s.text.slice(idx + m.quote.length);
+      const span = findSpan(s.text, m.quote);
+      if (!span) { next.push(s); continue; }
+      const [start, end] = span;
+      if (start > 0) next.push({ text: s.text.slice(0, start), cls: null, num: 0 });
+      next.push({ text: s.text.slice(start, end), cls: m.cls, num: m.num });
+      const rest = s.text.slice(end);
       if (rest) next.push({ text: rest, cls: null, num: 0 });
     }
     segs = next;
