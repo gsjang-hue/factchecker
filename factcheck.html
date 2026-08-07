@@ -2,6 +2,10 @@
 <!DOCTYPE html>
 <!--
   회의 FactCheck  (Gemini STT + Google Search grounding)
+  v0.5  2026.08.08  받아쓰기 품질 개선: (1) 중복 전사 해결 — 조각에 직전 텍스트를 맥락으로
+        넘기던 것을 제거(모델이 맥락을 그대로 다시 출력해 중복 발생). (2) 문단 분리를
+        조각 단위가 아니라 "긴 침묵(1.5s+)" 기준으로 바꿔, 짧은 쉼으로 잘린 조각은 같은
+        문단에 이어붙임(몇 단어씩 쪼개지던 문제 해결).
   v0.4  2026.08.08  ① STT 반응속도 개선(침묵 0.8→0.5s·최대 8→4.5s, 조각 병렬 처리).
         ② 받아쓰기를 문단(.seg) 단위로 표시. ③ 팩트체크 누적 — 재실행 시 이미 검증한
         주장은 건너뛰고 새 주장만 검증(토큰·시간 절약). ④ 전사문에서 팩트체크한 부분을
@@ -220,7 +224,7 @@
       키는 이 브라우저에만 저장됩니다 · <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">키 발급</a>
     </div>
     <div class="version-tag">
-      FactCheck v0.4 · 2026.08.08<br>
+      FactCheck v0.5 · 2026.08.08<br>
       <span class="cost">받아쓰기 ≈ $0.2/1hr · 팩트체크 1,500건/일 무료 후 건당 ≈ $0.04</span>
     </div>
   </div>
@@ -295,8 +299,11 @@ const SILENCE_MS = 500;             // 이만큼 조용하면 조각 확정(반�
 const MAX_CHUNK_MS = 4500;          // 침묵 없어도 이 길이면 강제로 끊음(지연 상한)
 const MIN_CHUNK_MS = 300;           // 이보다 짧으면 침묵으로 끊지 않음
 const PRECHUNK_TRIM_MS = 300;       // 발화 시작 전 남겨둘 최근 분량
+const PARA_BREAK_MS = 1500;         // 이 이상 쉬면 새 문단으로 분리(짧은 쉼은 같은 문단에 이어붙임)
 let stream = null, actx = null, proc = null;
 let chunkBuf = [], chunkSamples = 0, silentSamples = 0, hasSpeechInChunk = false;
+let interSilence = 0;               // 조각 사이(발화 시작 전) 침묵 누적 — 문단 분리 판단용
+let chunkNewPara = true;            // 이번 조각이 새 문단으로 시작해야 하는지
 let watchdog = null;
 /* STT 병렬 처리 풀 — 조각을 여러 개 동시에 보내되(속도), 순서대로 화면에 붙인다 */
 const STT_CONC = 3;
@@ -379,12 +386,19 @@ function updateCharCount() {
   const n = getTranscript().length;
   $('charCount').textContent = n ? n.toLocaleString() + '자' : '';
 }
-// 받아쓴 조각을 새 문단으로 추가
-function appendFinal(text) {
+// 받아쓴 조각을 추가한다. newPara=true면 새 문단, 아니면 직전 문단에 이어붙인다.
+function appendFinal(text, newPara) {
   const t = text.trim(); if (!t) return;
   const box = $('transcriptBox');
-  const d = document.createElement('div'); d.className = 'seg'; d.textContent = t;
-  box.appendChild(d);
+  const last = box.lastElementChild;
+  // 하이라이트된 문단(mark 포함)에는 이어붙이지 않고 새 문단을 만든다
+  const canAppend = !newPara && last && last.classList && last.classList.contains('seg') && !last.querySelector('mark');
+  if (canAppend) {
+    last.textContent = (last.textContent + ' ' + t).replace(/\s+/g, ' ').trim();
+  } else {
+    const d = document.createElement('div'); d.className = 'seg'; d.textContent = t;
+    box.appendChild(d);
+  }
   const sc = box.closest('.col-body'); if (sc) sc.scrollTop = sc.scrollHeight;
   onTranscriptEdit();
 }
@@ -396,6 +410,7 @@ function sttPrompt() {
     '- 이 오디오는 긴 회의를 몇 초 단위로 자른 조각이라 문장이 중간에서 시작되거나 끝날 수 있습니다. 있는 그대로 받아적으세요.\n' +
     '- 숫자·날짜·고유명사·전문용어를 정확히 표기하세요.\n' +
     '- 의미 있는 발화가 없으면(침묵·잡음뿐) text를 빈 문자열로 두세요.\n' +
+    '- 이 오디오에서 실제로 들린 것만 받아쓰고, 추측으로 앞뒤 내용을 지어내지 마세요.\n' +
     '- 설명·인사 없이 받아쓴 텍스트만 JSON의 text 필드에 담으세요.';
 }
 
@@ -416,13 +431,13 @@ function encodeWAV(samples, sampleRate) {
   return btoa(binary);
 }
 
-async function transcribeChunk(float32, ctx) {
+async function transcribeChunk(float32) {
   const model = $('model').value;
   const base64 = encodeWAV(float32, SR);
+  // 주의: 직전 텍스트를 맥락으로 넘기면 모델이 그 내용을 그대로 다시 출력(에코)해 중복이 생겨서 넘기지 않는다.
   const body = {
     systemInstruction: { parts: [{ text: sttPrompt() }] },
     contents: [{ role: 'user', parts: [
-      ...(ctx ? [{ text: '[직전 맥락] ' + ctx }] : []),
       { inlineData: { mimeType: 'audio/wav', data: base64 } }
     ] }],
     generationConfig: {
@@ -444,37 +459,41 @@ function updateSttStatus() {
 }
 
 // 조각을 최대 STT_CONC개까지 동시에 전송하되, 결과는 순서(id)대로만 화면에 붙인다
-function enqueueChunk(f) { chunkQueue.push({ id: sttSeq++, data: f }); pumpStt(); }
+function enqueueChunk(f, newPara) { chunkQueue.push({ id: sttSeq++, data: f, newPara: newPara }); pumpStt(); }
 function pumpStt() {
   while (sttInFlight < STT_CONC && chunkQueue.length) {
     const item = chunkQueue.shift();
     sttInFlight++;
-    const ctx = getTranscript().slice(-120);
-    transcribeChunk(item.data, ctx)
-      .then(text => { sttPending[item.id] = text || ''; })
-      .catch(e => { sttPending[item.id] = ''; setErr('받아쓰기 오류: ' + e.message); })
+    transcribeChunk(item.data)
+      .then(text => { sttPending[item.id] = { text: text || '', newPara: item.newPara }; })
+      .catch(e => { sttPending[item.id] = { text: '', newPara: item.newPara }; setErr('받아쓰기 오류: ' + e.message); })
       .finally(() => { sttInFlight--; flushStt(); pumpStt(); });
   }
   updateSttStatus();
 }
 function flushStt() {
   while (Object.prototype.hasOwnProperty.call(sttPending, sttNext)) {
-    const text = sttPending[sttNext]; delete sttPending[sttNext]; sttNext++;
-    if (text) { appendFinal(text); setErr(''); }
+    const p = sttPending[sttNext]; delete sttPending[sttNext]; sttNext++;
+    if (p && p.text) { appendFinal(p.text, p.newPara); setErr(''); }
   }
   updateSttStatus();
 }
 
+function resetChunk() { chunkBuf = []; chunkSamples = 0; silentSamples = 0; hasSpeechInChunk = false; }
 function finalizeChunk() {
-  if (chunkSamples === 0 || !hasSpeechInChunk) { chunkBuf = []; chunkSamples = 0; silentSamples = 0; hasSpeechInChunk = false; return; }
+  if (chunkSamples === 0 || !hasSpeechInChunk) { resetChunk(); return; }
   const merged = new Float32Array(chunkSamples);
   let off = 0; for (const b of chunkBuf) { merged.set(b, off); off += b.length; }
-  chunkBuf = []; chunkSamples = 0; silentSamples = 0; hasSpeechInChunk = false;
-  enqueueChunk(merged);
+  const trailing = silentSamples;   // 이 조각을 끝낸 후행 침묵 — 다음 조각 gap의 시작점
+  const np = chunkNewPara;
+  resetChunk();
+  interSilence = trailing;          // 다음 발화 전까지 침묵을 계속 더해 문단 분리 판단
+  chunkNewPara = false;
+  enqueueChunk(merged, np);
 }
 function flushPendingChunk() {
   if (chunkSamples > 0 && hasSpeechInChunk) finalizeChunk();
-  else { chunkBuf = []; chunkSamples = 0; silentSamples = 0; hasSpeechInChunk = false; }
+  else resetChunk();
 }
 
 // 침묵 감지로 문장 경계 근처에서 오디오를 자른다
@@ -485,13 +504,22 @@ function startMicProcessor() {
   const maxSamples = Math.round(SR * MAX_CHUNK_MS / 1000);
   const minSamples = Math.round(SR * MIN_CHUNK_MS / 1000);
   const preTrimSamples = Math.round(SR * PRECHUNK_TRIM_MS / 1000);
+  const paraBreakSamples = Math.round(SR * PARA_BREAK_MS / 1000);
   proc.onaudioprocess = ev => {
     const data = ev.inputBuffer.getChannelData(0);
     let sum = 0; for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
     const rms = Math.sqrt(sum / data.length);
     chunkBuf.push(new Float32Array(data)); chunkSamples += data.length;
-    if (rms < SILENCE_RMS) silentSamples += data.length;
-    else { silentSamples = 0; hasSpeechInChunk = true; }
+    if (rms < SILENCE_RMS) {
+      silentSamples += data.length;
+      if (!hasSpeechInChunk) interSilence += data.length;   // 발화 시작 전 침묵 누적
+    } else {
+      if (!hasSpeechInChunk) {                               // 이 조각의 첫 발화 시작
+        chunkNewPara = interSilence >= paraBreakSamples;     // 직전 쉼이 길면 새 문단
+        hasSpeechInChunk = true;
+      }
+      silentSamples = 0;
+    }
     if (hasSpeechInChunk && silentSamples >= silenceSamples && chunkSamples >= minSamples) { finalizeChunk(); return; }
     if (chunkSamples >= maxSamples) { finalizeChunk(); return; }
     if (!hasSpeechInChunk && chunkSamples > SR * 3) {
@@ -522,6 +550,7 @@ async function startRec() {
   try { if (actx.state === 'suspended') await actx.resume(); } catch (_) {}
   chunkBuf = []; chunkSamples = 0; silentSamples = 0; hasSpeechInChunk = false;
   chunkQueue = []; sttSeq = 0; sttNext = 0; sttInFlight = 0; sttPending = {};
+  interSilence = SR * 10; chunkNewPara = true;   // 첫 발화는 새 문단으로 시작
   startMicProcessor();
   recording = true;
   $('startBtn').disabled = true; $('stopBtn').disabled = false;
