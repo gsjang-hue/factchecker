@@ -57,6 +57,9 @@
   .set-note { font-size: 10px; color: #555; line-height: 1.5; flex-basis: 100%; }
   .set-note a { color: #8ab4d8; }
   .link-btn { background: transparent; color: #888; border: 0.5px solid #444; border-radius: 7px; padding: 6px 10px; font-size: 12px; }
+  .key-hint { font-size: 10px; color: #30d158; margin-top: 4px; min-height: 12px; }
+  .version-tag { font-size: 10px; color: #3d3d3d; align-self: flex-end; margin-left: auto; padding-bottom: 2px; letter-spacing: 0.03em; text-align: right; line-height: 1.6; }
+  .version-tag .cost { font-size: 9px; color: #30d158; }
 
   /* 상태바 */
   .statusbar { padding: 5px 1rem; display: flex; align-items: center; gap: 8px; font-size: 11px; color: #777; border-bottom: 0.5px solid #1a1a1a; flex-shrink: 0; }
@@ -168,7 +171,8 @@
   <div class="settings collapsed" id="settings">
     <div class="sg key-sg">
       <label>Google AI Studio API 키</label>
-      <input type="password" id="apiKey" placeholder="AIza..." oninput="saveSettings()">
+      <input type="password" id="apiKey" placeholder="AIza..." autocomplete="off" oninput="saveSettings()">
+      <div class="key-hint" id="keyHint"></div>
     </div>
     <div class="sg">
       <label>모델</label>
@@ -196,10 +200,11 @@
       <button class="link-btn" onclick="clearApiKey()">키 삭제</button>
     </div>
     <div class="set-note">
-      키는 이 브라우저(localStorage)에만 저장되며 외부로 전송되지 않습니다.
-      음성 기록은 마이크 오디오를 <b>Gemini로 받아쓰기(STT)</b> — 사파리·모바일 포함 모든 브라우저 지원, 대략 시간당 수백 원.
-      팩트체크는 <b>Gemini + Google 검색(grounding)</b>으로 동작(무료 한도 대략 일 1,500건 이후 과금).
-      키 발급: <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">aistudio.google.com/app/apikey</a>.
+      키는 이 브라우저에만 저장됩니다 · <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">키 발급</a>
+    </div>
+    <div class="version-tag">
+      FactCheck v0.2 · 2026.08.08<br>
+      <span class="cost">받아쓰기 ≈ $0.2/1hr · 팩트체크 1,500건/일 무료 후 건당 ≈ $0.04</span>
     </div>
   </div>
 
@@ -292,8 +297,12 @@ function showNotice(txt, type) {
 function esc(s) { return (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 /* ===================== 설정 로드/저장 ===================== */
+function showKeySaved(saved) {
+  $('keyHint').textContent = saved ? '✅ 저장된 키 사용 중' : '';
+}
 function loadSettings() {
   $('apiKey').value = localStorage.getItem(LS.key) || '';
+  showKeySaved(!!($('apiKey').value.trim()));
   const m = localStorage.getItem(LS.model); if (m) $('model').value = m;
   const mx = localStorage.getItem(LS.max); if (mx) $('maxClaims').value = mx;
   const f = localStorage.getItem(LS.font) || '15'; $('fontSize').value = f;
@@ -302,9 +311,11 @@ function loadSettings() {
   if (draft) { $('transcriptBox').value = draft; updateCharCount(); }
 }
 function saveSettings() {
-  localStorage.setItem(LS.key, $('apiKey').value.trim());
+  const k = $('apiKey').value.trim();
+  localStorage.setItem(LS.key, k);
   localStorage.setItem(LS.model, $('model').value);
   localStorage.setItem(LS.max, $('maxClaims').value);
+  showKeySaved(!!k);
 }
 function applyFontSize() {
   const f = $('fontSize').value;
@@ -313,7 +324,7 @@ function applyFontSize() {
 }
 function clearApiKey() {
   if (!confirm('저장된 API 키를 삭제할까요?')) return;
-  localStorage.removeItem(LS.key); $('apiKey').value = '';
+  localStorage.removeItem(LS.key); $('apiKey').value = ''; showKeySaved(false);
 }
 function toggleSettings() {
   $('settings').classList.toggle('collapsed');
