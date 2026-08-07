@@ -1,8 +1,12 @@
+
 <!DOCTYPE html>
 <!--
-  회의 FactCheck  (Gemini + Google Search grounding)
-  v0.1  2026.08.07 최초 버전
-        - Web Speech API(무료, ko-KR)로 회의 내용 실시간 기록
+  회의 FactCheck  (Gemini STT + Google Search grounding)
+  v0.2  2026.08.08  음성 기록을 Web Speech API → Gemini STT로 교체.
+        마이크 오디오를 침묵 기준으로 몇 초 조각으로 잘라(VAD) WAV로 Gemini에 전송해
+        받아쓴다. 사파리·모바일 포함 모든 브라우저에서 동작(Web Speech는 Chrome/Edge 전용).
+        오디오 캡처·VAD·WAV 인코딩은 translate/ Light 통역앱의 검증된 코드를 재사용.
+  v0.1  2026.08.07  최초 버전 (Web Speech API 기반)
         - "팩트체크" 버튼 → 그때까지의 기록에서 검증할 주장 추출(gemini-2.5-flash,
           구조화 JSON) → 주장별 Google Search grounding으로 검증 → 판정/근거/출처 카드
         - 서버·프록시 불필요. 브라우저에서 파일만 열면 동작. API 키는 localStorage 저장.
@@ -193,9 +197,9 @@
     </div>
     <div class="set-note">
       키는 이 브라우저(localStorage)에만 저장되며 외부로 전송되지 않습니다.
-      팩트체크는 <b>Gemini + Google 검색(grounding)</b>으로 동작합니다 —
+      음성 기록은 마이크 오디오를 <b>Gemini로 받아쓰기(STT)</b> — 사파리·모바일 포함 모든 브라우저 지원, 대략 시간당 수백 원.
+      팩트체크는 <b>Gemini + Google 검색(grounding)</b>으로 동작(무료 한도 대략 일 1,500건 이후 과금).
       키 발급: <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">aistudio.google.com/app/apikey</a>.
-      검색 grounding은 무료 한도(대략 일 1,500건) 이후 과금될 수 있습니다.
     </div>
   </div>
 
@@ -215,7 +219,7 @@
       <div class="col-header"><span>📝 회의 기록</span><span id="charCount" style="font-weight:400;letter-spacing:0;text-transform:none;color:#555;"></span></div>
       <div id="interimLine"></div>
       <div class="col-body">
-        <textarea id="transcriptBox" placeholder="여기에 회의 내용이 실시간으로 기록됩니다.&#10;마이크가 없거나 인식이 안 되면 직접 입력하거나 붙여넣어도 됩니다." oninput="onTranscriptEdit()"></textarea>
+        <textarea id="transcriptBox" placeholder="기록 시작 후 말하면 몇 초 뒤 여기에 받아써집니다.&#10;직접 입력하거나 붙여넣어도 됩니다." oninput="onTranscriptEdit()"></textarea>
       </div>
     </div>
     <div class="divider"></div>
@@ -255,11 +259,22 @@ const LS = {
   key: 'fc_apikey', model: 'fc_model', max: 'fc_maxclaims',
   font: 'fc_fontsize', sessions: 'fc_sessions', draft: 'fc_draft'
 };
-let recognizing = false;   // Web Speech 동작 중
-let userStopped = false;   // 사용자가 중지 눌렀는지(자동 재시작 방지)
+let recording = false;     // 녹음(STT) 동작 중
 let checking = false;      // 팩트체크 진행 중
-let recog = null;
 let lastResults = null;    // 최근 팩트체크 결과 배열
+
+/* Gemini STT (오디오 배치) — 마이크 오디오를 몇 초 조각으로 잘라 Gemini로 보내 받아쓴다.
+   Web Speech API와 달리 사파리·모바일 포함 모든 브라우저에서 동작. */
+const SR = 16000;                   // 샘플레이트
+const SILENCE_RMS = 0.010;          // 이 미만이면 "조용함"
+const SILENCE_MS = 800;             // 이만큼 조용하면 조각 확정
+const MAX_CHUNK_MS = 8000;          // 침묵 없어도 이 길이면 강제로 끊음
+const MIN_CHUNK_MS = 500;           // 이보다 짧으면 침묵으로 끊지 않음
+const PRECHUNK_TRIM_MS = 300;       // 발화 시작 전 남겨둘 최근 분량
+let stream = null, actx = null, proc = null;
+let chunkBuf = [], chunkSamples = 0, silentSamples = 0, hasSpeechInChunk = false;
+let chunkQueue = [], chunkProcessing = false, sttContext = '';
+let watchdog = null;
 
 /* ===================== 유틸 ===================== */
 const $ = id => document.getElementById(id);
@@ -328,69 +343,155 @@ function appendFinal(text) {
   onTranscriptEdit();
 }
 
-/* ===================== Web Speech API ===================== */
-function initRecognition() {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) return null;
-  const r = new SR();
-  r.lang = 'ko-KR';
-  r.continuous = true;
-  r.interimResults = true;
-  r.onresult = (e) => {
-    let interim = '';
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      const res = e.results[i];
-      if (res.isFinal) appendFinal(res[0].transcript);
-      else interim += res[0].transcript;
-    }
-    $('interimLine').textContent = interim;
-  };
-  r.onerror = (e) => {
-    if (e.error === 'no-speech' || e.error === 'aborted') return; // 무시하고 재시작 로직에 맡김
-    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-      setErr('마이크 권한이 거부되었습니다');
-      showNotice('마이크 사용이 차단되어 음성 기록을 쓸 수 없습니다. 회의 내용을 <b>직접 입력/붙여넣기</b> 한 뒤 팩트체크하세요.', 'warn');
-      userStopped = true; finishRecUI();
-    } else {
-      setErr('인식 오류: ' + e.error);
-    }
-  };
-  r.onend = () => {
-    // continuous라도 브라우저가 주기적으로 종료 → 사용자가 멈춘 게 아니면 재시작
-    if (!userStopped) { try { r.start(); } catch (_) {} }
-    else finishRecUI();
-  };
-  return r;
+/* ===================== Gemini STT (오디오 → 받아쓰기) ===================== */
+function sttPrompt() {
+  return '당신은 한국어 회의 받아쓰기(STT) 전문가입니다. 첨부된 오디오 조각을 듣고 ' +
+    '들린 내용을 그대로 한국어로 정확히 받아적으세요.\n' +
+    '- 이 오디오는 긴 회의를 몇 초 단위로 자른 조각이라 문장이 중간에서 시작되거나 끝날 수 있습니다. 있는 그대로 받아적으세요.\n' +
+    '- 숫자·날짜·고유명사·전문용어를 정확히 표기하세요.\n' +
+    '- 의미 있는 발화가 없으면(침묵·잡음뿐) text를 빈 문자열로 두세요.\n' +
+    '- 설명·인사 없이 받아쓴 텍스트만 JSON의 text 필드에 담으세요.';
 }
-function startRec() {
-  if (recognizing) return;
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) {
-    showNotice('이 브라우저는 음성 인식을 지원하지 않습니다(<b>Chrome / Edge 권장</b>). 회의 내용을 직접 입력한 뒤 팩트체크하세요.', 'warn');
+
+// 16bit PCM WAV로 인코딩 후 base64 반환 (Light 통역앱과 동일)
+function encodeWAV(samples, sampleRate) {
+  const n = samples.length;
+  const buffer = new ArrayBuffer(44 + n * 2);
+  const view = new DataView(buffer);
+  const writeStr = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+  writeStr(0, 'RIFF'); view.setUint32(4, 36 + n * 2, true); writeStr(8, 'WAVE');
+  writeStr(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  writeStr(36, 'data'); view.setUint32(40, n * 2, true);
+  let off = 44;
+  for (let i = 0; i < n; i++) { const s = Math.max(-1, Math.min(1, samples[i])); view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true); off += 2; }
+  let binary = ''; const bytes = new Uint8Array(buffer); const CH = 0x8000;
+  for (let i = 0; i < bytes.length; i += CH) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+  return btoa(binary);
+}
+
+async function transcribeChunk(float32) {
+  const model = $('model').value;
+  const base64 = encodeWAV(float32, SR);
+  const body = {
+    systemInstruction: { parts: [{ text: sttPrompt() }] },
+    contents: [{ role: 'user', parts: [
+      ...(sttContext ? [{ text: '[직전 맥락] ' + sttContext }] : []),
+      { inlineData: { mimeType: 'audio/wav', data: base64 } }
+    ] }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      responseSchema: { type: 'OBJECT', properties: { text: { type: 'STRING' } }, required: ['text'] }
+    }
+  };
+  const data = await geminiCall(body, model);
+  let obj = {}; try { obj = JSON.parse(extractText(data)); } catch (_) {}
+  return (obj.text || '').trim();
+}
+
+function updateSttStatus() {
+  const busy = chunkProcessing || chunkQueue.length;
+  $('interimLine').textContent = busy
+    ? ('⏳ 받아쓰는 중…' + (chunkQueue.length ? ' (대기 ' + chunkQueue.length + ')' : ''))
+    : (recording ? '🎙 듣는 중…' : '');
+}
+
+async function processQueue() {
+  if (chunkProcessing || !chunkQueue.length) return;
+  chunkProcessing = true; updateSttStatus();
+  const chunk = chunkQueue.shift();
+  try {
+    const text = await transcribeChunk(chunk);
+    if (text) { appendFinal(text); sttContext = ($('transcriptBox').value || '').slice(-120); setErr(''); }
+  } catch (e) { setErr('받아쓰기 오류: ' + e.message); }
+  chunkProcessing = false; updateSttStatus();
+  if (chunkQueue.length) processQueue();
+}
+function enqueueChunk(f) { chunkQueue.push(f); processQueue(); }
+
+function finalizeChunk() {
+  if (chunkSamples === 0 || !hasSpeechInChunk) { chunkBuf = []; chunkSamples = 0; silentSamples = 0; hasSpeechInChunk = false; return; }
+  const merged = new Float32Array(chunkSamples);
+  let off = 0; for (const b of chunkBuf) { merged.set(b, off); off += b.length; }
+  chunkBuf = []; chunkSamples = 0; silentSamples = 0; hasSpeechInChunk = false;
+  enqueueChunk(merged);
+}
+function flushPendingChunk() {
+  if (chunkSamples > 0 && hasSpeechInChunk) finalizeChunk();
+  else { chunkBuf = []; chunkSamples = 0; silentSamples = 0; hasSpeechInChunk = false; }
+}
+
+// 침묵 감지로 문장 경계 근처에서 오디오를 자른다
+function startMicProcessor() {
+  const src = actx.createMediaStreamSource(stream);
+  proc = actx.createScriptProcessor(2048, 1, 1);
+  const silenceSamples = Math.round(SR * SILENCE_MS / 1000);
+  const maxSamples = Math.round(SR * MAX_CHUNK_MS / 1000);
+  const minSamples = Math.round(SR * MIN_CHUNK_MS / 1000);
+  const preTrimSamples = Math.round(SR * PRECHUNK_TRIM_MS / 1000);
+  proc.onaudioprocess = ev => {
+    const data = ev.inputBuffer.getChannelData(0);
+    let sum = 0; for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+    const rms = Math.sqrt(sum / data.length);
+    chunkBuf.push(new Float32Array(data)); chunkSamples += data.length;
+    if (rms < SILENCE_RMS) silentSamples += data.length;
+    else { silentSamples = 0; hasSpeechInChunk = true; }
+    if (hasSpeechInChunk && silentSamples >= silenceSamples && chunkSamples >= minSamples) { finalizeChunk(); return; }
+    if (chunkSamples >= maxSamples) { finalizeChunk(); return; }
+    if (!hasSpeechInChunk && chunkSamples > SR * 3) {
+      const merged = new Float32Array(chunkSamples);
+      let off = 0; for (const b of chunkBuf) { merged.set(b, off); off += b.length; }
+      chunkBuf = [merged.slice(-preTrimSamples)]; chunkSamples = chunkBuf[0].length; silentSamples = chunkSamples;
+    }
+  };
+  src.connect(proc); proc.connect(actx.destination);
+}
+
+async function startRec() {
+  if (recording) return;
+  const key = (localStorage.getItem(LS.key) || '').trim();
+  if (!key) { if ($('settings').classList.contains('collapsed')) toggleSettings(); setErr('먼저 API 키를 입력하세요'); return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showNotice('이 브라우저는 마이크 입력을 지원하지 않습니다. 회의 내용을 <b>직접 입력/붙여넣기</b> 하세요.', 'warn'); return;
+  }
+  setErr('');
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: SR, channelCount: 1, echoCancellation: true, noiseSuppression: true }, video: false });
+  } catch (e) {
+    setErr('마이크 권한 필요: ' + e.message);
+    showNotice('마이크 사용이 차단되어 음성 기록을 쓸 수 없습니다. 회의 내용을 <b>직접 입력/붙여넣기</b> 한 뒤 팩트체크하세요.', 'warn');
     return;
   }
-  if (!recog) recog = initRecognition();
-  userStopped = false;
-  try { recog.start(); } catch (_) {}
-  recognizing = true;
-  setErr(''); $('interimLine').textContent = '';
+  actx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR });
+  try { if (actx.state === 'suspended') await actx.resume(); } catch (_) {}
+  chunkBuf = []; chunkSamples = 0; silentSamples = 0; hasSpeechInChunk = false;
+  chunkQueue = []; chunkProcessing = false;
+  sttContext = ($('transcriptBox').value || '').slice(-120);
+  startMicProcessor();
+  recording = true;
   $('startBtn').disabled = true; $('stopBtn').disabled = false;
-  setStatus('🎙 기록 중… 말하는 내용이 자동으로 적힙니다', 'recording');
+  setStatus('🎙 기록 중… 말하면 몇 초 뒤 자동으로 적힙니다', 'recording');
+  updateSttStatus();
+  // Safari/iOS 등에서 오디오 컨텍스트가 조용히 정지되면 되살린다
+  watchdog = setInterval(() => { if (actx && actx.state === 'suspended') { try { actx.resume(); } catch (_) {} } }, 1500);
 }
+
 function stopRec() {
-  if (!recognizing) return;
-  userStopped = true;
-  try { recog.stop(); } catch (_) {}
-}
-function finishRecUI() {
-  recognizing = false;
+  if (!recording) return;
+  recording = false;
+  flushPendingChunk();
+  if (proc) { try { proc.disconnect(); } catch (_) {} proc = null; }
+  if (actx) { try { actx.close(); } catch (_) {} actx = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (watchdog) { clearInterval(watchdog); watchdog = null; }
   $('startBtn').disabled = false; $('stopBtn').disabled = true;
-  $('interimLine').textContent = '';
-  setStatus('일시정지 — 이어서 기록하거나 팩트체크하세요');
+  setStatus(chunkQueue.length || chunkProcessing ? '남은 조각을 받아쓰는 중…' : '일시정지 — 이어서 기록하거나 팩트체크하세요');
+  updateSttStatus();
 }
 function clearRec() {
   if ($('transcriptBox').value && !confirm('현재 기록을 모두 지울까요?')) return;
-  $('transcriptBox').value = ''; onTranscriptEdit();
+  $('transcriptBox').value = ''; onTranscriptEdit(); sttContext = '';
   $('resultCards').innerHTML = '<div class="empty-msg">회의 기록을 남긴 뒤<br><b>🔍 팩트체크</b> 버튼을 누르면<br>검증할 주장을 뽑아 인터넷 검색으로 확인해 드립니다.</div>';
   $('resultSummary').classList.remove('show'); lastResults = null;
 }
@@ -646,11 +747,10 @@ function closeModal() { $('modal').classList.add('hidden'); }
 (function init() {
   loadSettings();
   updateCharCount();
-  if (!(window.SpeechRecognition || window.webkitSpeechRecognition)) {
-    showNotice('이 브라우저는 음성 인식을 지원하지 않습니다(<b>Chrome / Edge 권장</b>). 회의 내용을 직접 입력/붙여넣기 한 뒤 팩트체크할 수 있습니다.', 'info');
-  }
-  if (location.protocol === 'file:') {
-    // file://에서도 Web Speech는 대개 동작하지만, 일부 환경은 https가 필요할 수 있음
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showNotice('이 브라우저는 마이크 입력을 지원하지 않습니다. 회의 내용을 직접 입력/붙여넣기 한 뒤 팩트체크할 수 있습니다.', 'info');
+  } else if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.protocol !== 'file:') {
+    showNotice('마이크는 <b>https</b> 주소에서만 동작합니다. GitHub Pages(https)로 접속하세요.', 'warn');
   }
 })();
 </script>
