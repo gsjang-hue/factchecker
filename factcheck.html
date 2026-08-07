@@ -2,6 +2,9 @@
 <!DOCTYPE html>
 <!--
   회의 FactCheck  (Gemini STT + Google Search grounding)
+  v0.6  2026.08.08  받아쓰기 정확도 개선: (1) 조각 크기 확대(침묵 0.5→0.7s·최대 4.5→9s)로
+        문장 중간 오절단·문맥부족 오인식 완화. (2) '회의 주제·키워드' 선택 입력 추가 —
+        STT 프롬프트에 힌트로 넣어 고유명사·전문용어 인식률을 높임(맥락 에코 없이).
   v0.5  2026.08.08  받아쓰기 품질 개선: (1) 중복 전사 해결 — 조각에 직전 텍스트를 맥락으로
         넘기던 것을 제거(모델이 맥락을 그대로 다시 출력해 중복 발생). (2) 문단 분리를
         조각 단위가 아니라 "긴 침묵(1.5s+)" 기준으로 바꿔, 짧은 쉼으로 잘린 조각은 같은
@@ -207,6 +210,10 @@
       <label>1회 최대 검증 수</label>
       <input type="number" id="maxClaims" min="1" max="30" value="10" onchange="saveSettings()">
     </div>
+    <div class="sg" style="flex:1 1 240px;">
+      <label>회의 주제·키워드 (선택 — 받아쓰기 정확도↑)</label>
+      <input type="text" id="topicHint" placeholder="예: EU 가입, 오르반 빅토르, 몬테네그로, 친러" style="width:100%;" oninput="saveSettings()">
+    </div>
     <div class="sg">
       <label>글자 크기</label>
       <select id="fontSize" onchange="applyFontSize()">
@@ -224,7 +231,7 @@
       키는 이 브라우저에만 저장됩니다 · <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">키 발급</a>
     </div>
     <div class="version-tag">
-      FactCheck v0.5 · 2026.08.08<br>
+      FactCheck v0.6 · 2026.08.08<br>
       <span class="cost">받아쓰기 ≈ $0.2/1hr · 팩트체크 1,500건/일 무료 후 건당 ≈ $0.04</span>
     </div>
   </div>
@@ -283,7 +290,7 @@
 /* ===================== 상태 & 저장 ===================== */
 const LS = {
   key: 'fc_apikey', model: 'fc_model', max: 'fc_maxclaims',
-  font: 'fc_fontsize', sessions: 'fc_sessions', draft: 'fc_draft'
+  font: 'fc_fontsize', sessions: 'fc_sessions', draft: 'fc_draft', topic: 'fc_topic'
 };
 let recording = false;     // 녹음(STT) 동작 중
 let checking = false;      // 팩트체크 진행 중
@@ -295,8 +302,8 @@ let currentSessionId = null; // 현재 회의 세션(재실행 시 같은 세션
    Web Speech API와 달리 사파리·모바일 포함 모든 브라우저에서 동작. */
 const SR = 16000;                   // 샘플레이트
 const SILENCE_RMS = 0.010;          // 이 미만이면 "조용함"
-const SILENCE_MS = 500;             // 이만큼 조용하면 조각 확정(반응 빠르게)
-const MAX_CHUNK_MS = 4500;          // 침묵 없어도 이 길이면 강제로 끊음(지연 상한)
+const SILENCE_MS = 700;             // 이만큼 조용하면 조각 확정(문장 중간 오절단 완화)
+const MAX_CHUNK_MS = 9000;          // 침묵 없어도 이 길이면 강제로 끊음(길게 이어 말할 때 정확도↑)
 const MIN_CHUNK_MS = 300;           // 이보다 짧으면 침묵으로 끊지 않음
 const PRECHUNK_TRIM_MS = 300;       // 발화 시작 전 남겨둘 최근 분량
 const PARA_BREAK_MS = 1500;         // 이 이상 쉬면 새 문단으로 분리(짧은 쉼은 같은 문단에 이어붙임)
@@ -335,6 +342,7 @@ function loadSettings() {
   const m = localStorage.getItem(LS.model);
   if (m && [...$('model').options].some(o => o.value === m)) $('model').value = m;
   const mx = localStorage.getItem(LS.max); if (mx) $('maxClaims').value = mx;
+  $('topicHint').value = localStorage.getItem(LS.topic) || '';
   const f = localStorage.getItem(LS.font) || '15'; $('fontSize').value = f;
   applyFontSize();
   const draft = localStorage.getItem(LS.draft);
@@ -345,6 +353,7 @@ function saveSettings() {
   localStorage.setItem(LS.key, k);
   localStorage.setItem(LS.model, $('model').value);
   localStorage.setItem(LS.max, $('maxClaims').value);
+  localStorage.setItem(LS.topic, $('topicHint').value.trim());
   showKeySaved(!!k);
 }
 function applyFontSize() {
@@ -404,11 +413,12 @@ function appendFinal(text, newPara) {
 }
 
 /* ===================== Gemini STT (오디오 → 받아쓰기) ===================== */
-function sttPrompt() {
+function sttPrompt(hint) {
   return '당신은 한국어 회의 받아쓰기(STT) 전문가입니다. 첨부된 오디오 조각을 듣고 ' +
     '들린 내용을 그대로 한국어로 정확히 받아적으세요.\n' +
     '- 이 오디오는 긴 회의를 몇 초 단위로 자른 조각이라 문장이 중간에서 시작되거나 끝날 수 있습니다. 있는 그대로 받아적으세요.\n' +
     '- 숫자·날짜·고유명사·전문용어를 정확히 표기하세요.\n' +
+    (hint ? '- 이 회의의 주제와 자주 등장하는 고유명사/용어: ' + hint + '. 발음이 이 용어들과 비슷하면 반드시 이 표기로 받아적으세요.\n' : '') +
     '- 의미 있는 발화가 없으면(침묵·잡음뿐) text를 빈 문자열로 두세요.\n' +
     '- 이 오디오에서 실제로 들린 것만 받아쓰고, 추측으로 앞뒤 내용을 지어내지 마세요.\n' +
     '- 설명·인사 없이 받아쓴 텍스트만 JSON의 text 필드에 담으세요.';
@@ -433,10 +443,11 @@ function encodeWAV(samples, sampleRate) {
 
 async function transcribeChunk(float32) {
   const model = $('model').value;
+  const hint = ($('topicHint').value || '').trim();
   const base64 = encodeWAV(float32, SR);
   // 주의: 직전 텍스트를 맥락으로 넘기면 모델이 그 내용을 그대로 다시 출력(에코)해 중복이 생겨서 넘기지 않는다.
   const body = {
-    systemInstruction: { parts: [{ text: sttPrompt() }] },
+    systemInstruction: { parts: [{ text: sttPrompt(hint) }] },
     contents: [{ role: 'user', parts: [
       { inlineData: { mimeType: 'audio/wav', data: base64 } }
     ] }],
