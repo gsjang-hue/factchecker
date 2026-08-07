@@ -2,6 +2,11 @@
 <!DOCTYPE html>
 <!--
   회의 FactCheck  (Gemini STT + Google Search grounding)
+  v0.4  2026.08.08  ① STT 반응속도 개선(침묵 0.8→0.5s·최대 8→4.5s, 조각 병렬 처리).
+        ② 받아쓰기를 문단(.seg) 단위로 표시. ③ 팩트체크 누적 — 재실행 시 이미 검증한
+        주장은 건너뛰고 새 주장만 검증(토큰·시간 절약). ④ 전사문에서 팩트체크한 부분을
+        판정 색으로 하이라이트(주장 추출 시 원문 quote를 함께 받아 매칭). 전사창을
+        textarea→contenteditable div로 교체.
   v0.3  2026.08.08  모델을 Gemini 3세대로 교체(2.5 계열은 신규 사용자 차단·2026.10 종료).
         gemini-3.6-flash(권장)·gemini-3.5-flash-lite(저가)·gemini-3.1-pro(정밀).
         2.5-flash의 한국어 받아쓰기 부정확 문제도 3.6-flash로 개선. 구형 저장 모델값은
@@ -90,8 +95,16 @@
 
   /* 기록창 */
   #interimLine { font-size: 12px; color: #f0c674; min-height: 16px; padding: 2px 1rem; opacity: 0.85; font-style: italic; flex-shrink: 0; }
-  #transcriptBox { width: 100%; height: 100%; background: transparent; border: none; outline: none; resize: none; color: #d0ecd0; font-size: var(--pt-size, 15px); line-height: 1.75; font-family: inherit; }
-  #transcriptBox::placeholder { color: #3a4a3a; }
+  #transcriptBox { min-height: 100%; outline: none; color: #d0ecd0; font-size: var(--pt-size, 15px); line-height: 1.75; word-break: break-word; white-space: pre-wrap; }
+  #transcriptBox:empty:before { content: attr(data-ph); color: #3a4a3a; white-space: pre-wrap; }
+  #transcriptBox .seg { margin-bottom: 10px; }   /* 받아쓰기 문단 단위 */
+  /* 전사문 하이라이트 — 팩트체크한 부분을 판정 색으로 표시 */
+  mark.hl { border-radius: 3px; padding: 0 2px; color: inherit; }
+  mark.hl-true    { background: #1d3a1d; color: #c6f0c6; }
+  mark.hl-false   { background: #3a1414; color: #ffc2bd; }
+  mark.hl-exagg   { background: #3a3210; color: #f4d94a; }
+  mark.hl-unsure  { background: #12283a; color: #bcdcff; }
+  mark.hl-context { background: #241a3a; color: #d9c2ff; }
 
   /* 결과 요약 줄 */
   .result-summary { font-size: 12px; color: #aaa; padding: 6px 10px; background: #151515; border: 0.5px solid #262626; border-radius: 8px; margin-bottom: 12px; line-height: 1.6; display: none; }
@@ -187,7 +200,7 @@
       </select>
     </div>
     <div class="sg">
-      <label>최대 검증 주장 수</label>
+      <label>1회 최대 검증 수</label>
       <input type="number" id="maxClaims" min="1" max="30" value="10" onchange="saveSettings()">
     </div>
     <div class="sg">
@@ -207,7 +220,7 @@
       키는 이 브라우저에만 저장됩니다 · <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">키 발급</a>
     </div>
     <div class="version-tag">
-      FactCheck v0.3 · 2026.08.08<br>
+      FactCheck v0.4 · 2026.08.08<br>
       <span class="cost">받아쓰기 ≈ $0.2/1hr · 팩트체크 1,500건/일 무료 후 건당 ≈ $0.04</span>
     </div>
   </div>
@@ -228,7 +241,7 @@
       <div class="col-header"><span>📝 회의 기록</span><span id="charCount" style="font-weight:400;letter-spacing:0;text-transform:none;color:#555;"></span></div>
       <div id="interimLine"></div>
       <div class="col-body">
-        <textarea id="transcriptBox" placeholder="기록 시작 후 말하면 몇 초 뒤 여기에 받아써집니다.&#10;직접 입력하거나 붙여넣어도 됩니다." oninput="onTranscriptEdit()"></textarea>
+        <div id="transcriptBox" contenteditable="true" data-ph="기록 시작 후 말하면 몇 초 뒤 여기에 받아써집니다.&#10;직접 입력하거나 붙여넣어도 됩니다." oninput="onTranscriptEdit()"></div>
       </div>
     </div>
     <div class="divider"></div>
@@ -270,20 +283,24 @@ const LS = {
 };
 let recording = false;     // 녹음(STT) 동작 중
 let checking = false;      // 팩트체크 진행 중
-let lastResults = null;    // 최근 팩트체크 결과 배열
+let lastResults = [];      // 누적 팩트체크 결과 배열(버튼 재실행 시 이어붙임)
+let checkedKeys = new Set(); // 이미 검증한 주장 키(중복 검증 방지)
+let currentSessionId = null; // 현재 회의 세션(재실행 시 같은 세션 갱신)
 
 /* Gemini STT (오디오 배치) — 마이크 오디오를 몇 초 조각으로 잘라 Gemini로 보내 받아쓴다.
    Web Speech API와 달리 사파리·모바일 포함 모든 브라우저에서 동작. */
 const SR = 16000;                   // 샘플레이트
 const SILENCE_RMS = 0.010;          // 이 미만이면 "조용함"
-const SILENCE_MS = 800;             // 이만큼 조용하면 조각 확정
-const MAX_CHUNK_MS = 8000;          // 침묵 없어도 이 길이면 강제로 끊음
-const MIN_CHUNK_MS = 500;           // 이보다 짧으면 침묵으로 끊지 않음
+const SILENCE_MS = 500;             // 이만큼 조용하면 조각 확정(반응 빠르게)
+const MAX_CHUNK_MS = 4500;          // 침묵 없어도 이 길이면 강제로 끊음(지연 상한)
+const MIN_CHUNK_MS = 300;           // 이보다 짧으면 침묵으로 끊지 않음
 const PRECHUNK_TRIM_MS = 300;       // 발화 시작 전 남겨둘 최근 분량
 let stream = null, actx = null, proc = null;
 let chunkBuf = [], chunkSamples = 0, silentSamples = 0, hasSpeechInChunk = false;
-let chunkQueue = [], chunkProcessing = false, sttContext = '';
 let watchdog = null;
+/* STT 병렬 처리 풀 — 조각을 여러 개 동시에 보내되(속도), 순서대로 화면에 붙인다 */
+const STT_CONC = 3;
+let chunkQueue = [], sttSeq = 0, sttNext = 0, sttInFlight = 0, sttPending = {};
 
 /* ===================== 유틸 ===================== */
 const $ = id => document.getElementById(id);
@@ -314,7 +331,7 @@ function loadSettings() {
   const f = localStorage.getItem(LS.font) || '15'; $('fontSize').value = f;
   applyFontSize();
   const draft = localStorage.getItem(LS.draft);
-  if (draft) { $('transcriptBox').value = draft; updateCharCount(); }
+  if (draft) { setTranscript(draft); updateCharCount(); }
 }
 function saveSettings() {
   const k = $('apiKey').value.trim();
@@ -346,17 +363,29 @@ function switchTab(name) {
 }
 
 /* ===================== 기록창 ===================== */
-function onTranscriptEdit() { updateCharCount(); localStorage.setItem(LS.draft, $('transcriptBox').value); }
+// 전사문 전체를 평문으로 얻는다(문단 사이 줄바꿈 포함)
+function getTranscript() { return ($('transcriptBox').innerText || '').replace(/ /g, ' ').replace(/\n{3,}/g, '\n\n').trim(); }
+// 평문을 문단(.seg) 단위로 그려 넣는다
+function setTranscript(text) {
+  const box = $('transcriptBox'); box.innerHTML = '';
+  (text || '').split('\n').forEach(line => {
+    if (line.trim() === '') return;
+    const d = document.createElement('div'); d.className = 'seg'; d.textContent = line;
+    box.appendChild(d);
+  });
+}
+function onTranscriptEdit() { updateCharCount(); localStorage.setItem(LS.draft, getTranscript()); }
 function updateCharCount() {
-  const n = $('transcriptBox').value.length;
+  const n = getTranscript().length;
   $('charCount').textContent = n ? n.toLocaleString() + '자' : '';
 }
+// 받아쓴 조각을 새 문단으로 추가
 function appendFinal(text) {
-  const box = $('transcriptBox');
   const t = text.trim(); if (!t) return;
-  const sep = box.value && !/\s$/.test(box.value) ? ' ' : '';
-  box.value += sep + t;
-  box.scrollTop = box.scrollHeight;
+  const box = $('transcriptBox');
+  const d = document.createElement('div'); d.className = 'seg'; d.textContent = t;
+  box.appendChild(d);
+  const sc = box.closest('.col-body'); if (sc) sc.scrollTop = sc.scrollHeight;
   onTranscriptEdit();
 }
 
@@ -387,13 +416,13 @@ function encodeWAV(samples, sampleRate) {
   return btoa(binary);
 }
 
-async function transcribeChunk(float32) {
+async function transcribeChunk(float32, ctx) {
   const model = $('model').value;
   const base64 = encodeWAV(float32, SR);
   const body = {
     systemInstruction: { parts: [{ text: sttPrompt() }] },
     contents: [{ role: 'user', parts: [
-      ...(sttContext ? [{ text: '[직전 맥락] ' + sttContext }] : []),
+      ...(ctx ? [{ text: '[직전 맥락] ' + ctx }] : []),
       { inlineData: { mimeType: 'audio/wav', data: base64 } }
     ] }],
     generationConfig: {
@@ -408,24 +437,33 @@ async function transcribeChunk(float32) {
 }
 
 function updateSttStatus() {
-  const busy = chunkProcessing || chunkQueue.length;
-  $('interimLine').textContent = busy
-    ? ('⏳ 받아쓰는 중…' + (chunkQueue.length ? ' (대기 ' + chunkQueue.length + ')' : ''))
+  const pending = chunkQueue.length + sttInFlight;
+  $('interimLine').textContent = pending
+    ? ('⏳ 받아쓰는 중…' + (pending > 1 ? ' (' + pending + ')' : ''))
     : (recording ? '🎙 듣는 중…' : '');
 }
 
-async function processQueue() {
-  if (chunkProcessing || !chunkQueue.length) return;
-  chunkProcessing = true; updateSttStatus();
-  const chunk = chunkQueue.shift();
-  try {
-    const text = await transcribeChunk(chunk);
-    if (text) { appendFinal(text); sttContext = ($('transcriptBox').value || '').slice(-120); setErr(''); }
-  } catch (e) { setErr('받아쓰기 오류: ' + e.message); }
-  chunkProcessing = false; updateSttStatus();
-  if (chunkQueue.length) processQueue();
+// 조각을 최대 STT_CONC개까지 동시에 전송하되, 결과는 순서(id)대로만 화면에 붙인다
+function enqueueChunk(f) { chunkQueue.push({ id: sttSeq++, data: f }); pumpStt(); }
+function pumpStt() {
+  while (sttInFlight < STT_CONC && chunkQueue.length) {
+    const item = chunkQueue.shift();
+    sttInFlight++;
+    const ctx = getTranscript().slice(-120);
+    transcribeChunk(item.data, ctx)
+      .then(text => { sttPending[item.id] = text || ''; })
+      .catch(e => { sttPending[item.id] = ''; setErr('받아쓰기 오류: ' + e.message); })
+      .finally(() => { sttInFlight--; flushStt(); pumpStt(); });
+  }
+  updateSttStatus();
 }
-function enqueueChunk(f) { chunkQueue.push(f); processQueue(); }
+function flushStt() {
+  while (Object.prototype.hasOwnProperty.call(sttPending, sttNext)) {
+    const text = sttPending[sttNext]; delete sttPending[sttNext]; sttNext++;
+    if (text) { appendFinal(text); setErr(''); }
+  }
+  updateSttStatus();
+}
 
 function finalizeChunk() {
   if (chunkSamples === 0 || !hasSpeechInChunk) { chunkBuf = []; chunkSamples = 0; silentSamples = 0; hasSpeechInChunk = false; return; }
@@ -483,8 +521,7 @@ async function startRec() {
   actx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR });
   try { if (actx.state === 'suspended') await actx.resume(); } catch (_) {}
   chunkBuf = []; chunkSamples = 0; silentSamples = 0; hasSpeechInChunk = false;
-  chunkQueue = []; chunkProcessing = false;
-  sttContext = ($('transcriptBox').value || '').slice(-120);
+  chunkQueue = []; sttSeq = 0; sttNext = 0; sttInFlight = 0; sttPending = {};
   startMicProcessor();
   recording = true;
   $('startBtn').disabled = true; $('stopBtn').disabled = false;
@@ -503,14 +540,15 @@ function stopRec() {
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
   if (watchdog) { clearInterval(watchdog); watchdog = null; }
   $('startBtn').disabled = false; $('stopBtn').disabled = true;
-  setStatus(chunkQueue.length || chunkProcessing ? '남은 조각을 받아쓰는 중…' : '일시정지 — 이어서 기록하거나 팩트체크하세요');
+  setStatus(chunkQueue.length || sttInFlight ? '남은 조각을 받아쓰는 중…' : '일시정지 — 이어서 기록하거나 팩트체크하세요');
   updateSttStatus();
 }
 function clearRec() {
-  if ($('transcriptBox').value && !confirm('현재 기록을 모두 지울까요?')) return;
-  $('transcriptBox').value = ''; onTranscriptEdit(); sttContext = '';
+  if (getTranscript() && !confirm('현재 기록과 팩트체크 결과를 모두 지울까요?')) return;
+  $('transcriptBox').innerHTML = ''; onTranscriptEdit();
   $('resultCards').innerHTML = '<div class="empty-msg">회의 기록을 남긴 뒤<br><b>🔍 팩트체크</b> 버튼을 누르면<br>검증할 주장을 뽑아 인터넷 검색으로 확인해 드립니다.</div>';
-  $('resultSummary').classList.remove('show'); lastResults = null;
+  $('resultSummary').classList.remove('show');
+  lastResults = []; checkedKeys = new Set(); currentSessionId = null;
 }
 
 /* ===================== Gemini 호출 ===================== */
@@ -547,14 +585,18 @@ function extractSources(data) {
 }
 
 /* ── Pass A: 검증할 주장 추출 ── */
-async function extractClaims(transcript, model, max) {
+async function extractClaims(transcript, model, max, exclude) {
+  const excludeBlock = (exclude && exclude.length)
+    ? '\n\n[이미 검증이 끝난 주장] 아래와 같은 내용은 절대 다시 포함하지 말고, 새로 등장한 내용만 뽑아라:\n- ' + exclude.join('\n- ') + '\n'
+    : '';
   const prompt =
     '다음은 한국어 회의를 받아쓴 기록이다. 이 중에서 "사실 여부를 인터넷 검색으로 검증할 가치가 있는 주장"만 골라라.\n' +
     '- 숫자·통계·날짜·고유명사·역사적/과학적 사실·인용·시장 데이터 등 객관적으로 확인 가능한 사실 주장만 선택\n' +
     '- 개인 의견, 감정 표현, 미래 계획/다짐, 애매한 잡담, 인사말은 제외\n' +
-    '- 각 주장은 그 자체로 검색 가능하도록 완결된 한 문장으로 다시 써라\n' +
+    '- claim: 그 자체로 검색 가능하도록 완결된 한 문장으로 다시 써라\n' +
+    '- quote: 그 주장의 근거가 된 부분을 회의 원문에서 "그대로 복사"해서 넣어라(수정·요약·재작성 금지, 원문 문구 그대로여야 화면 표시에 쓰인다)\n' +
     '- 중요도가 높은 순으로 최대 ' + max + '개까지\n' +
-    '- 검증할 만한 주장이 없으면 빈 배열을 반환\n\n' +
+    '- 검증할 만한 주장이 없으면 빈 배열을 반환' + excludeBlock + '\n\n' +
     '회의 기록:\n"""\n' + transcript + '\n"""';
   const body = {
     contents: [{ parts: [{ text: prompt }] }],
@@ -565,7 +607,7 @@ async function extractClaims(transcript, model, max) {
         type: 'ARRAY',
         items: {
           type: 'OBJECT',
-          properties: { claim: { type: 'STRING' }, context: { type: 'STRING' } },
+          properties: { claim: { type: 'STRING' }, quote: { type: 'STRING' }, context: { type: 'STRING' } },
           required: ['claim']
         }
       }
@@ -580,9 +622,44 @@ async function extractClaims(transcript, model, max) {
 
 /* ── Pass B: 주장 1건을 Google 검색으로 검증 ── */
 const VERDICTS = {
-  '사실': { cls: 'v-true' }, '거짓': { cls: 'v-false' }, '과장': { cls: 'v-exagg' },
-  '불확실': { cls: 'v-unsure' }, '맥락필요': { cls: 'v-context' }
+  '사실': { cls: 'v-true', hl: 'hl-true' }, '거짓': { cls: 'v-false', hl: 'hl-false' },
+  '과장': { cls: 'v-exagg', hl: 'hl-exagg' }, '불확실': { cls: 'v-unsure', hl: 'hl-unsure' },
+  '맥락필요': { cls: 'v-context', hl: 'hl-context' }
 };
+
+/* ── 전사문 하이라이트: 각 결과의 원문 quote를 찾아 판정 색으로 감싼다 ── */
+function buildMarks(results) {
+  return (results || []).filter(r => r.quote && r.quote.trim())
+    .map(r => ({ quote: r.quote.trim(), cls: (VERDICTS[r.verdict] || VERDICTS['불확실']).hl }));
+}
+// 한 문단 안에서 marks를 겹치지 않게 감싸 HTML 반환
+function highlightPara(para, marks) {
+  let segs = [{ text: para, cls: null }];
+  for (const m of marks) {
+    const next = [];
+    for (const s of segs) {
+      if (s.cls) { next.push(s); continue; }
+      const idx = s.text.indexOf(m.quote);
+      if (idx < 0 || !m.quote) { next.push(s); continue; }
+      if (idx > 0) next.push({ text: s.text.slice(0, idx), cls: null });
+      next.push({ text: s.text.slice(idx, idx + m.quote.length), cls: m.cls });
+      const rest = s.text.slice(idx + m.quote.length);
+      if (rest) next.push({ text: rest, cls: null });
+    }
+    segs = next;
+  }
+  return segs.map(s => s.cls ? '<mark class="hl ' + s.cls + '">' + esc(s.text) + '</mark>' : esc(s.text)).join('');
+}
+function highlightedParas(text, results) {
+  const marks = buildMarks(results);
+  return (text || '').split('\n').filter(p => p.trim() !== '')
+    .map(p => '<div class="seg">' + highlightPara(p, marks) + '</div>').join('');
+}
+function highlightTranscript(results) {
+  const text = getTranscript(); if (!text) return;
+  $('transcriptBox').innerHTML = highlightedParas(text, results);
+}
+function claimKey(x) { return ((x && (x.quote || x.claim)) || '').replace(/\s+/g, '').toLowerCase(); }
 async function verifyClaim(item, model) {
   const prompt =
     '다음 "주장"이 사실인지 Google 검색으로 확인하고 판정하라.\n' +
@@ -606,35 +683,41 @@ async function verifyClaim(item, model) {
   if (vm) verdict = vm[1];
   const rm = text.match(/근거\s*[:：]\s*([\s\S]+)/);
   if (rm) reason = rm[1].trim();
-  return { claim: item.claim, verdict, reason, sources };
+  return { claim: item.claim, quote: item.quote || '', verdict, reason, sources };
 }
 
-/* ── 팩트체크 실행 ── */
+/* ── 팩트체크 실행 (누적: 이미 검증한 주장은 건너뛰고 새 주장만) ── */
 async function runFactcheck() {
   if (checking) return;
   const key = (localStorage.getItem(LS.key) || '').trim();
-  if (!key) { toggleSettings(); setErr('먼저 API 키를 입력하세요'); return; }
-  const transcript = $('transcriptBox').value.trim();
+  if (!key) { if ($('settings').classList.contains('collapsed')) toggleSettings(); setErr('먼저 API 키를 입력하세요'); return; }
+  const transcript = getTranscript();
   if (transcript.length < 5) { setErr('회의 기록이 비어 있습니다'); return; }
 
   const model = $('model').value;
   const max = Math.max(1, Math.min(30, parseInt($('maxClaims').value) || 10));
   checking = true; setErr('');
   $('factBtn').disabled = true;
-  $('resultSummary').classList.remove('show');
   const cards = $('resultCards');
+  const ph = cards.querySelector('.empty-msg'); if (ph) ph.remove();   // 첫 실행 시 안내문 제거
+  const spin = document.createElement('div'); spin.className = 'fc-spin'; spin.textContent = '🧠 새로 검증할 주장을 찾는 중…';
+  cards.appendChild(spin);
 
   try {
     setStatus('🧠 검증할 주장을 찾는 중…', 'working');
-    cards.innerHTML = '<div class="fc-spin">🧠 회의 내용에서 검증할 주장을 추출하는 중…</div>';
-    const claims = await extractClaims(transcript, model, max);
+    const exclude = lastResults.map(r => r.claim);
+    let claims = await extractClaims(transcript, model, max, exclude);
+    claims = claims.filter(c => !checkedKeys.has(claimKey(c)));   // 클라이언트 측 중복 제거
+    spin.remove();
+
     if (!claims.length) {
-      cards.innerHTML = '<div class="empty-msg">검증할 만한 사실 주장을 찾지 못했습니다.<br>내용을 더 기록한 뒤 다시 시도해 보세요.</div>';
-      setStatus('완료 — 검증할 주장 없음'); return;
+      if (!lastResults.length) cards.innerHTML = '<div class="empty-msg">검증할 만한 사실 주장을 찾지 못했습니다.<br>내용을 더 기록한 뒤 다시 시도해 보세요.</div>';
+      setStatus(lastResults.length ? '완료 — 새로 검증할 주장이 없습니다 (누적 ' + lastResults.length + '건)' : '완료 — 검증할 주장 없음');
+      return;
     }
-    // 카드 자리 미리 생성
-    cards.innerHTML = '';
-    const nodes = claims.map((c, i) => {
+
+    // 새 주장 카드만 추가 생성(기존 카드는 유지)
+    const nodes = claims.map(c => {
       const d = document.createElement('div');
       d.className = 'fc-card loading';
       d.innerHTML = '<div class="fc-claim">' + esc(c.claim) + '</div><div class="fc-spin">🔍 검색·검증 중…</div>';
@@ -642,28 +725,30 @@ async function runFactcheck() {
     });
 
     const results = new Array(claims.length);
-    let done = 0;
-    const CONC = 3; let idx = 0;
+    let done = 0; const CONC = 3; let idx = 0;
     async function worker() {
       while (idx < claims.length) {
         const i = idx++;
-        setStatus('🔍 인터넷 검색으로 검증 중… (' + (done) + '/' + claims.length + ')', 'working');
         try { results[i] = await verifyClaim(claims[i], model); }
-        catch (e) { results[i] = { claim: claims[i].claim, verdict: '불확실', reason: '검증 실패: ' + e.message, sources: [] }; }
+        catch (e) { results[i] = { claim: claims[i].claim, quote: claims[i].quote || '', verdict: '불확실', reason: '검증 실패: ' + e.message, sources: [] }; }
         done++;
         renderCard(nodes[i], results[i]);
         setStatus('🔍 인터넷 검색으로 검증 중… (' + done + '/' + claims.length + ')', 'working');
       }
     }
+    setStatus('🔍 인터넷 검색으로 검증 중… (0/' + claims.length + ')', 'working');
     await Promise.all(Array.from({ length: Math.min(CONC, claims.length) }, worker));
 
-    lastResults = results;
-    renderSummary(results);
-    saveSession(transcript, results);
-    setStatus('✅ 팩트체크 완료 — ' + results.length + '건 검증');
+    lastResults = lastResults.concat(results);            // 누적
+    results.forEach(r => checkedKeys.add(claimKey(r)));
+    renderSummary(lastResults);
+    highlightTranscript(lastResults);                     // 전사문에 판정 색 표시
+    saveSession(transcript, lastResults);
+    setStatus('✅ 완료 — 이번 ' + results.length + '건, 누적 ' + lastResults.length + '건');
   } catch (e) {
+    spin.remove();
     setErr('오류: ' + e.message);
-    cards.innerHTML = '<div class="empty-msg">팩트체크 중 오류가 발생했습니다.<br>' + esc(e.message) + '</div>';
+    if (!lastResults.length) cards.appendChild(Object.assign(document.createElement('div'), { className: 'empty-msg', innerHTML: '팩트체크 중 오류가 발생했습니다.<br>' + esc(e.message) }));
     setStatus('오류 발생');
   } finally {
     checking = false; $('factBtn').disabled = false;
@@ -704,12 +789,15 @@ function saveSession(transcript, results) {
   const list = loadSessions();
   const now = new Date();
   const title = transcript.slice(0, 24).replace(/\s+/g, ' ') + (transcript.length > 24 ? '…' : '');
-  list.unshift({
-    id: 'fc_' + now.getTime(),
+  const rec = {
+    id: currentSessionId || ('fc_' + now.getTime()),
     title: title || '(제목 없음)',
     date: now.toLocaleString('ko-KR'),
     transcript, results
-  });
+  };
+  currentSessionId = rec.id;
+  const i = list.findIndex(s => s.id === rec.id);
+  if (i >= 0) list[i] = rec; else list.unshift(rec);   // 재실행 시 같은 세션 갱신(누적)
   // 저장 용량 보호: 최근 30개까지
   try { localStorage.setItem(LS.sessions, JSON.stringify(list.slice(0, 30))); }
   catch (_) { localStorage.setItem(LS.sessions, JSON.stringify(list.slice(0, 10))); }
@@ -740,7 +828,7 @@ function deleteSession(id) {
 }
 function openModal(s) {
   $('modalTitle').textContent = s.title;
-  let html = '<h4>회의 기록</h4><div class="modal-transcript">' + esc(s.transcript) + '</div>';
+  let html = '<h4>회의 기록</h4><div class="modal-transcript">' + highlightedParas(s.transcript, s.results) + '</div>';
   html += '<h4>팩트체크 결과 (' + (s.results || []).length + '건)</h4>';
   (s.results || []).forEach(r => {
     const v = VERDICTS[r.verdict] || VERDICTS['불확실'];
