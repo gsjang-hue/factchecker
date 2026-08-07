@@ -2,6 +2,10 @@
 <!DOCTYPE html>
 <!--
   회의 FactCheck  (Gemini STT + Google Search grounding)
+  v1.1  2026.08.08  받아쓰기 언어 선택 추가(자동 감지 / 한국어 / English / 日本語 등).
+        기존엔 프롬프트가 "한국어로 받아적으세요"로 편향돼 영어 오디오에 한국어가 끼어드는
+        문제가 있었음 → 편향 제거하고, 언어 고정 시 "그 언어로만, 번역 금지"로 지시. 자동
+        감지는 "들린 언어 그대로, 번역 금지".
   v1.0  2026.08.08  ① 저장기록 상세에 AI 요약 — 회의 narrative 요약 + 뒷부분에 '사실'이 아닌
         판정(거짓·과장·맥락필요·불확실)만 따로 정리(buildFlaggedSection). 요약은 세션에 저장.
         ② 글자크기 조정이 팩트체크 결과 카드에도 적용되도록 --pt-size를 .fc-claim/.fc-reason에 연결.
@@ -247,6 +251,19 @@
       </select>
     </div>
     <div class="sg">
+      <label>받아쓰기 언어</label>
+      <select id="sttLang" onchange="saveSettings()">
+        <option value="auto">자동 감지</option>
+        <option value="ko">한국어</option>
+        <option value="en">English</option>
+        <option value="ja">日本語</option>
+        <option value="zh">中文</option>
+        <option value="es">Español</option>
+        <option value="de">Deutsch</option>
+        <option value="fr">Français</option>
+      </select>
+    </div>
+    <div class="sg">
       <label>1회 최대 검증 수</label>
       <input type="number" id="maxClaims" min="1" max="30" value="10" onchange="saveSettings()">
     </div>
@@ -271,7 +288,7 @@
       키는 이 브라우저에만 저장됩니다 · <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">키 발급</a>
     </div>
     <div class="version-tag">
-      FactCheck v1.0 · 2026.08.08<br>
+      FactCheck v1.1 · 2026.08.08<br>
       <span class="cost">받아쓰기 ≈ $0.2/1hr · 팩트체크 1,500건/일 무료 후 건당 ≈ $0.04</span>
     </div>
   </div>
@@ -347,7 +364,7 @@
 /* ===================== 상태 & 저장 ===================== */
 const LS = {
   key: 'fc_apikey', model: 'fc_model', max: 'fc_maxclaims',
-  font: 'fc_fontsize', sessions: 'fc_sessions', draft: 'fc_draft', topic: 'fc_topic'
+  font: 'fc_fontsize', sessions: 'fc_sessions', draft: 'fc_draft', topic: 'fc_topic', sttlang: 'fc_sttlang'
 };
 let recording = false;     // 녹음(STT) 동작 중
 let checking = false;      // 팩트체크 진행 중
@@ -416,6 +433,7 @@ function loadSettings() {
   const m = localStorage.getItem(LS.model);
   if (m && [...$('model').options].some(o => o.value === m)) $('model').value = m;
   const mx = localStorage.getItem(LS.max); if (mx) $('maxClaims').value = mx;
+  const sl = localStorage.getItem(LS.sttlang); if (sl) $('sttLang').value = sl;
   $('topicHint').value = localStorage.getItem(LS.topic) || '';
   const f = localStorage.getItem(LS.font) || '15'; $('fontSize').value = f;
   applyFontSize();
@@ -428,6 +446,7 @@ function saveSettings() {
   localStorage.setItem(LS.model, $('model').value);
   localStorage.setItem(LS.max, $('maxClaims').value);
   localStorage.setItem(LS.topic, $('topicHint').value.trim());
+  localStorage.setItem(LS.sttlang, $('sttLang').value);
   showKeySaved(!!k);
 }
 function applyFontSize() {
@@ -516,9 +535,13 @@ function appendFinal(text, longPause) {
 }
 
 /* ===================== Gemini STT (오디오 → 받아쓰기) ===================== */
-function sttPrompt(hint) {
-  return '당신은 한국어 회의 받아쓰기(STT) 전문가입니다. 첨부된 오디오 조각을 듣고 ' +
-    '들린 내용을 그대로 한국어로 정확히 받아적으세요.\n' +
+const STT_LANG_NAME = { ko: '한국어', en: '영어', ja: '일본어', zh: '중국어', es: '스페인어', de: '독일어', fr: '프랑스어' };
+function sttPrompt(hint, lang) {
+  const langLine = (lang && lang !== 'auto' && STT_LANG_NAME[lang])
+    ? '- 이 오디오는 주로 ' + STT_LANG_NAME[lang] + '입니다. 반드시 ' + STT_LANG_NAME[lang] + '로만 받아적고, 다른 언어로 번역하거나 다른 언어 문장을 끼워 넣지 마세요(고유명사·짧은 외국어 인용은 원문 그대로 허용).\n'
+    : '- 발화된 언어 그대로 받아적고, 절대 다른 언어로 번역하지 마세요(영어면 영어로, 한국어면 한국어로). 한 조각 안에서 언어를 임의로 바꾸지 마세요.\n';
+  return '당신은 회의 받아쓰기(STT) 전문가입니다. 첨부된 오디오 조각을 듣고 실제로 들린 말을 그대로 정확히 받아적으세요.\n' +
+    langLine +
     '- 이 오디오는 긴 회의를 몇 초 단위로 자른 조각이라 문장이 중간에서 시작되거나 끝날 수 있습니다. 있는 그대로 받아적으세요.\n' +
     '- 숫자·날짜·고유명사·전문용어를 정확히 표기하세요.\n' +
     '- 한 문장이 완결되면 끝에 마침표(.)·물음표(?)·느낌표(!)를 붙이고, 문장 중간에서 잘린 것 같으면 문장부호를 붙이지 마세요.\n' +
@@ -548,10 +571,11 @@ function encodeWAV(samples, sampleRate) {
 async function transcribeChunk(float32) {
   const model = $('model').value;
   const hint = ($('topicHint').value || '').trim();
+  const lang = $('sttLang').value || 'auto';
   const base64 = encodeWAV(float32, SR);
   // 주의: 직전 텍스트를 맥락으로 넘기면 모델이 그 내용을 그대로 다시 출력(에코)해 중복이 생겨서 넘기지 않는다.
   const body = {
-    systemInstruction: { parts: [{ text: sttPrompt(hint) }] },
+    systemInstruction: { parts: [{ text: sttPrompt(hint, lang) }] },
     contents: [{ role: 'user', parts: [
       { inlineData: { mimeType: 'audio/wav', data: base64 } }
     ] }],
