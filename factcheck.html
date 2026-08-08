@@ -2,6 +2,8 @@
 <!DOCTYPE html>
 <!--
   회의 FactCheck  (Gemini STT + Google Search grounding)
+  v1.2  2026.08.08  설정에 '내 기기 ID' 표시(통계에서 내 접속 제외용). 기기 ID는 fc_deviceId로
+        localStorage에 영구 저장(브라우저마다 고정, translate의 gtl_deviceId와는 별개).
   v1.1  2026.08.08  받아쓰기 언어 선택 추가(자동 감지 / 한국어 / English / 日本語 등).
         기존엔 프롬프트가 "한국어로 받아적으세요"로 편향돼 영어 오디오에 한국어가 끼어드는
         문제가 있었음 → 편향 제거하고, 언어 고정 시 "그 언어로만, 번역 금지"로 지시. 자동
@@ -285,10 +287,11 @@
       <button class="link-btn" onclick="clearApiKey()">키 삭제</button>
     </div>
     <div class="set-note">
-      키는 이 브라우저에만 저장됩니다 · <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">키 발급</a>
+      키는 이 브라우저에만 저장됩니다 · <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">키 발급</a><br>
+      이 기기 ID(통계에서 내 접속 제외용): <b id="devIdShow" style="color:#888;">—</b>
     </div>
     <div class="version-tag">
-      FactCheck v1.1 · 2026.08.08<br>
+      FactCheck v1.2 · 2026.08.08<br>
       <span class="cost">받아쓰기 ≈ $0.2/1hr · 팩트체크 1,500건/일 무료 후 건당 ≈ $0.04</span>
     </div>
   </div>
@@ -1195,6 +1198,7 @@ async function summarizeModal() {
     showNotice('마이크는 <b>https</b> 주소에서만 동작합니다. GitHub Pages(https)로 접속하세요.', 'warn');
   }
   sendUsageEvent('open');
+  try { $('devIdShow').textContent = getDeviceId(); } catch (_) {}
 })();
 </script>
 <!-- 방문 통계(GoatCounter) — translate 앱과 동일 계정 -->
